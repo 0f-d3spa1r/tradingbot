@@ -211,3 +211,21 @@ def train_final_model(X_train: pd.DataFrame, y_train: pd.Series, best_params: di
         plt.title(f"Confusion Matrix @ Confidence ≥ {threshold:.2f}")
         plt.savefig(f"outputs/conf_matrix_conf_{int(threshold*100)}.png")
         plt.close()
+
+
+def load_model_and_scaler(model_path="models/saved_model.cbm", scaler_path="scaler.pkl"):
+    """Загружает обученную модель и скейлер"""
+    model = cb.CatBoostClassifier()
+    model.load_model(model_path)
+
+    with open(scaler_path, "rb") as f:
+        scaler = pickle.load(f)
+
+    return model, scaler
+
+
+def predict_on_batch(model, X_input):
+    """Выполняет предсказание и возвращает классы и вероятности"""
+    probs = model.predict_proba(X_input)
+    preds = model.predict(X_input)
+    return preds.tolist(), probs.tolist()
