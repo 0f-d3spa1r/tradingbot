@@ -157,17 +157,31 @@ def rolling_cross_validation(X: pd.DataFrame, y: pd.Series, model_params: dict, 
 
 def train_final_model(X_train: pd.DataFrame, y_train: pd.Series, best_params: dict):
     best_params["depth"] = int(best_params["depth"])
-    best_params.update({"loss_function": "MultiClass", "random_seed": 42, "iterations": 500, "verbose": False})
+    best_params.update({
+        "loss_function": "MultiClass",
+        "random_seed": 42,
+        "iterations": 500,
+        "verbose": False
+    })
 
     model = cb.CatBoostClassifier(**best_params)
     sample_weight = compute_sample_weight(class_weight="balanced", y=y_train)
     cat_features = X_train.select_dtypes(include=["category", "object"]).columns.tolist()
 
-    model.fit(X_train, y_train, sample_weight=sample_weight, cat_features=cat_features,
-              eval_set=(X_train, y_train), early_stopping_rounds=20)
+    model.fit(
+        X_train, y_train,
+        sample_weight=sample_weight,
+        cat_features=cat_features,
+        eval_set=(X_train, y_train),
+        early_stopping_rounds=20
+    )
 
     os.makedirs("models", exist_ok=True)
     model.save_model("models/saved_model.cbm")
+
+    # 🆕 Сохраняем список категориальных фичей
+    with open("models/cat_features.pkl", "wb") as f:
+        pickle.dump(cat_features, f)
 
     y_pred = model.predict(X_train)
     proba = model.predict_proba(X_train)
@@ -213,19 +227,52 @@ def train_final_model(X_train: pd.DataFrame, y_train: pd.Series, best_params: di
         plt.close()
 
 
-def load_model_and_scaler(model_path="models/saved_model.cbm", scaler_path="scaler.pkl"):
-    """Загружает обученную модель и скейлер"""
+
+def load_model_and_scaler(
+    model_path="models/saved_model.cbm",
+    scaler_path="scaler.pkl",
+    cat_features_path="models/cat_features.pkl"
+):
+    """Загружает обученную модель, скейлер и список категориальных признаков"""
     model = cb.CatBoostClassifier()
     model.load_model(model_path)
 
     with open(scaler_path, "rb") as f:
         scaler = pickle.load(f)
 
-    return model, scaler
+    with open(cat_features_path, "rb") as f:
+        cat_features = pickle.load(f)
+
+    return model, scaler, cat_features
 
 
-def predict_on_batch(model, X_input):
-    """Выполняет предсказание и возвращает классы и вероятности"""
-    probs = model.predict_proba(X_input)
-    preds = model.predict(X_input)
-    return preds.tolist(), probs.tolist()
+
+def predict_on_batch(model, X_input, cat_features=None):
+    """
+    Выполняет предсказание и возвращает классы и уверенность (вероятность положительного класса).
+
+    Параметры:
+        model: Обученная модель CatBoost
+        X_input (pd.DataFrame): Входные признаки
+        cat_features (list, optional): Список категориальных признаков (по именам)
+
+    Возвращает:
+        preds (List): Список предсказанных классов
+        confidences (List): Уверенность модели (вероятности положительного класса)
+    """
+    if cat_features is not None:
+        cat_feature_indices = [X_input.columns.get_loc(col) for col in cat_features]
+    else:
+        cat_feature_indices = None
+
+    pool = cb.Pool(X_input, cat_features=cat_feature_indices)
+
+    preds = model.predict(pool)
+    probs = model.predict_proba(pool)
+
+    # ⚠️ Возьми только вероятность положительного класса (обычно класс 1)
+    confidences = [p[1] for p in probs]
+
+    return preds.tolist(), confidences
+
+

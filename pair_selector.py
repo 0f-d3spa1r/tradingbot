@@ -10,6 +10,10 @@ import talib
 import logging
 from collections import OrderedDict
 
+
+from pybit.unified_trading import HTTP
+from data_loader import set_client as set_data_client
+
 logger = logging.getLogger(__name__)
 
 
@@ -140,25 +144,12 @@ def evaluate_pairs(
 ) -> Union[List[str], List[Tuple[str, float]]]:
     """
     Оценивает пары и возвращает топ-N по скору.
-
-    Параметры:
-        symbols: Список тикеров
-        interval: Интервал OHLCV (например, '15')
-        top_n: Сколько пар вернуть
-        weights: Кастомные веса для compute_pair_score
-        signal_threshold: Порог уверенности для сигналов
-        return_scores: Если True — вернуть пары вместе со score
-        debug: Если True — логировать детали
-        window: Сколько последних свечей взять для оценки
-        save_results: Если True — сохранить top_pairs в CSV
-        model, scaler: Опциональные предзагруженные модель и скейлер
-
-    Возвращает:
-        List[str] или List[Tuple[str, float]]
     """
 
     if model is None or scaler is None:
-        model, scaler = load_model_and_scaler()
+        model, scaler, cat_features = load_model_and_scaler()
+    else:
+        cat_features = None
 
     pair_scores = []
 
@@ -166,7 +157,6 @@ def evaluate_pairs(
         try:
             df = get_processed_ohlcv(symbol, interval).tail(window)
 
-            # Обработка признаков (импорт здесь, чтобы не грузить заранее)
             from feature_engineering import select_features
             X, _ = select_features(df)
 
@@ -176,10 +166,13 @@ def evaluate_pairs(
             X_scaled = pd.DataFrame(scaler.transform(X_num), columns=X_num.columns)
             X_input = pd.concat([X_scaled, X_cat.reset_index(drop=True)], axis=1)
 
-            # Прогноз
-            preds, confs = predict_on_batch(model, X_input)
+            # Используем cat_features, если загружены
+            if cat_features is None:
+                cat_features = X_input.select_dtypes(include=["object", "category"]).columns.tolist()
+
+            preds, confs = predict_on_batch(model, X_input, cat_features=cat_features)
             model_data = {
-                "confidences": confs[-50:],  # последние 50 точек
+                "confidences": confs[-50:],
                 "predictions": preds[-50:]
             }
 
@@ -217,3 +210,22 @@ def evaluate_pairs(
             logger.warning(f"[!] Не удалось сохранить файл: {e}")
 
     return top_pairs if return_scores else [s for s, _ in top_pairs]
+
+
+
+def rank_pairs(symbols: List[str], interval: str = "15", top_n: int = 5) -> List[Tuple[str, float]]:
+    return evaluate_pairs(
+        symbols=symbols,
+        interval=interval,
+        top_n=top_n,
+        return_scores=True,  # ✅ теперь так
+        debug=True
+    )
+
+
+
+def set_client(client: HTTP):
+    """
+    Проксирует установку клиента в data_loader (если нужно).
+    """
+    set_data_client(client)

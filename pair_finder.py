@@ -43,7 +43,7 @@ def fetch_all_symbols() -> List[str]:
         raise RuntimeError("Pybit client не установлен. Используйте set_client().")
 
     try:
-        symbols = _client.get_tickers(category="linear")["result"]["list"]
+        symbols = _client.get_tickers(category="spot")["result"]["list"]
         return [
             s["symbol"] for s in symbols
             if any(q in s["symbol"] for q in QUOTE_ASSETS)

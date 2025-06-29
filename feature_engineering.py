@@ -67,6 +67,9 @@ def generate_candle_patterns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def generate_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+
     df["hour"] = df.index.hour
     df["day_of_week"] = df.index.dayofweek
     df["session"] = pd.cut(
@@ -74,8 +77,10 @@ def generate_time_features(df: pd.DataFrame) -> pd.DataFrame:
         bins=[0, 6, 13, 21, 24],
         labels=["Asia_1", "Europe", "US", "Asia_2"],
         right=False
-    )
+    ).astype(str)  # 👈 добавь это
+
     return df
+
 
 
 def generate_derivatives(df: pd.DataFrame) -> pd.DataFrame:
