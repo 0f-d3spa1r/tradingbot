@@ -1,52 +1,37 @@
 # pair_selector.py
 import os
-from data_loader import get_processed_ohlcv
-from model_trainer import load_model_and_scaler, predict_on_batch
-import pandas as pd
-import numpy as np
-from typing import Dict, Union, Tuple, List
-from ta.trend import EMAIndicator
-import talib
 import logging
 from collections import OrderedDict
+from typing import Dict, Union, Tuple, List, Optional
 
-
+import numpy as np
+import pandas as pd
+import talib
+from ta.trend import EMAIndicator
 from pybit.unified_trading import HTTP
+
+from data_loader import fetch_ohlcv
+from model_trainer import load_model_and_scaler, predict_on_batch
 from data_loader import set_client as set_data_client
 
 logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# 🧮 Основная функция скоринга пары
+# ============================================================
 def compute_pair_score(
     df: pd.DataFrame,
     model_data: Dict[str, list],
-    weights: Dict[str, float] = None,
+    weights: Optional[Dict[str, float]] = None,
     return_details: bool = False,
     signal_threshold: float = 0.65,
     debug: bool = False
 ) -> Union[float, Tuple[float, Dict[str, float]]]:
     """
-    Вычисляет скоринг торговой пары на основе технических и модельных факторов.
-
-    Параметры:
-        df (pd.DataFrame): Исторические данные OHLCV. Должен содержать колонки: 'close', 'volume', 'high', 'low'.
-        model_data (Dict): {'confidences': List[float], 'predictions': List[int]}
-        weights (Dict): Весовые коэффициенты:
-            - 'volume': вес средней ликвидности (в млн)
-            - 'atr': вес волатильности (ATR как % от цены)
-            - 'ema_diff': вес расхождения EMA
-            - 'adx': вес направленного движения
-            - 'signals': вес частоты сигналов
-            - 'conf_mean': вес средней уверенности
-            - 'conf_std': вес разброса уверенности (отрицательный)
-        return_details (bool): Если True — возвращает score и детали по метрикам.
-        signal_threshold (float): Порог уверенности для учёта сигнала.
-        debug (bool): Логировать подробности при return_details=True.
-
-    Возвращает:
-        float — итоговый score (или tuple с деталями, если включено).
+    Рассчитывает скоринг пары на основе тех. метрик и данных модели.
+    model_data: {'confidences': List[float], 'predictions': List[int]}
     """
-
     default_weights = {
         "volume": 1.0,
         "atr": 1.5,
@@ -54,7 +39,7 @@ def compute_pair_score(
         "adx": 1.0,
         "signals": 1.0,
         "conf_mean": 2.0,
-        "conf_std": -1.0
+        "conf_std": -1.0,
     }
     w = {**default_weights, **(weights or {})}
 
@@ -71,7 +56,7 @@ def compute_pair_score(
             raise ValueError("model_data['confidences'] отсутствует или пуст")
 
         # --- Технические метрики ---
-        avg_volume = volume.rolling(50).mean().iloc[-1]
+        avg_volume = volume.rolling(50, min_periods=50).mean().iloc[-1]
         atr = talib.ATR(high, low, close, timeperiod=14).fillna(0).iloc[-1]
         ema_fast = EMAIndicator(close, window=5).ema_indicator()
         ema_slow = EMAIndicator(close, window=20).ema_indicator()
@@ -80,46 +65,45 @@ def compute_pair_score(
         adx = talib.ADX(high, low, close, timeperiod=14).fillna(0).iloc[-1]
 
         # --- Модельные метрики ---
-        confidences = pd.Series(model_data["confidences"]).fillna(0)
-        signals_count = (confidences >= signal_threshold).sum()
-        mean_conf = confidences.mean()
-        std_conf = confidences.std()
+        confidences = pd.Series(model_data["confidences"]).astype(float).fillna(0.0)
+        signals_count = int((confidences >= signal_threshold).sum())
+        mean_conf = float(confidences.mean())
+        std_conf = float(confidences.std())
 
         # --- Нормализация ---
-        norm_volume = min(avg_volume / 1_000_000, 2)
-        norm_atr = min(atr / close.iloc[-1], 0.05) * 100
-        norm_ema = min(ema_diff, 0.05) * 100
-        norm_adx = min(adx / 50, 1)
-        norm_signals = min(signals_count / 10, 1)
+        norm_volume = min(float(avg_volume) / 1_000_000.0, 2.0)
+        norm_atr = min(float(atr) / float(close.iloc[-1]), 0.05) * 100.0
+        norm_ema = min(float(ema_diff), 0.05) * 100.0
+        norm_adx = min(float(adx) / 50.0, 1.0)
+        norm_signals = min(signals_count / 10.0, 1.0)
 
         # --- Финальный скор ---
         score = (
-            norm_volume * w["volume"] +
-            norm_atr * w["atr"] +
-            norm_ema * w["ema_diff"] +
-            norm_adx * w["adx"] +
-            norm_signals * w["signals"] +
-            mean_conf * w["conf_mean"] +
-            std_conf * w["conf_std"]
+            norm_volume * w["volume"]
+            + norm_atr * w["atr"]
+            + norm_ema * w["ema_diff"]
+            + norm_adx * w["adx"]
+            + norm_signals * w["signals"]
+            + mean_conf * w["conf_mean"]
+            + std_conf * w["conf_std"]
         )
-
-        score = round(score, 4)
+        score = round(float(score), 4)
 
         if return_details:
-            details = OrderedDict({
-                "norm_volume": round(norm_volume, 4),
-                "norm_atr": round(norm_atr, 4),
-                "norm_ema": round(norm_ema, 4),
-                "norm_adx": round(norm_adx, 4),
-                "norm_signals": round(norm_signals, 4),
-                "mean_conf": round(mean_conf, 4),
-                "std_conf": round(std_conf, 4),
-                "score": score
-            })
-
+            details = OrderedDict(
+                {
+                    "norm_volume": round(norm_volume, 4),
+                    "norm_atr": round(norm_atr, 4),
+                    "norm_ema": round(norm_ema, 4),
+                    "norm_adx": round(norm_adx, 4),
+                    "norm_signals": round(norm_signals, 4),
+                    "mean_conf": round(mean_conf, 4),
+                    "std_conf": round(std_conf, 4),
+                    "score": score,
+                }
+            )
             if debug:
                 logger.info(f"[Score details] {details}")
-
             return score, details
 
         return score
@@ -129,11 +113,14 @@ def compute_pair_score(
         return 0.0 if not return_details else (0.0, {"error": str(e)})
 
 
+# ============================================================
+# 🧠 Оценка нескольких пар (основная логика)
+# ============================================================
 def evaluate_pairs(
     symbols: List[str],
     interval: str,
     top_n: int = 5,
-    weights: Dict[str, float] = None,
+    weights: Optional[Dict[str, float]] = None,
     signal_threshold: float = 0.65,
     return_scores: bool = False,
     debug: bool = False,
@@ -145,48 +132,86 @@ def evaluate_pairs(
     """
     Оценивает пары и возвращает топ-N по скору.
     """
-
+    # === Загружаем модель и скейлер ===
     if model is None or scaler is None:
         model, scaler, cat_features = load_model_and_scaler()
     else:
         cat_features = None
 
-    pair_scores = []
+    pair_scores: List[Tuple[str, float]] = []
+
+    from feature_engineering import select_features
 
     for symbol in symbols:
         try:
-            df = get_processed_ohlcv(symbol, interval).tail(window)
+            # 1️⃣ Данные: сырые свечи
+            df = fetch_ohlcv(symbol, interval, limit=max(window, 60)).tail(window)
 
-            from feature_engineering import select_features
+            # 2️⃣ Генерация признаков
             X, _ = select_features(df)
 
-            X_cat = X.select_dtypes(include=["object"])
+            # Ранние проверки
+            if X.empty:
+                if debug:
+                    logger.warning(f"[{symbol}] Пустой набор признаков после feature engineering — пропускаю.")
+                continue
+
+            X_cat = X.select_dtypes(include=["object", "category"])
             X_num = X.select_dtypes(include=["number"])
 
-            X_scaled = pd.DataFrame(scaler.transform(X_num), columns=X_num.columns)
-            X_input = pd.concat([X_scaled, X_cat.reset_index(drop=True)], axis=1)
+            if X_num.empty:
+                if debug:
+                    logger.warning(f"[{symbol}] Нет числовых признаков (X_num.empty) — пропускаю.")
+                continue
 
-            # Используем cat_features, если загружены
+            # 3️⃣ Выравнивание под scaler.feature_names_in_
+            if hasattr(scaler, "feature_names_in_"):
+                for col in scaler.feature_names_in_:
+                    if col not in X_num.columns:
+                        X_num[col] = 0.0
+                keep_order = [c for c in scaler.feature_names_in_ if c in X_num.columns]
+                X_num = X_num.loc[:, keep_order]
+
+            # 4️⃣ Скейлинг
+            try:
+                X_scaled = pd.DataFrame(
+                    scaler.transform(X_num),
+                    columns=X_num.columns,
+                    index=X_num.index
+                )
+            except Exception as te:
+                logger.warning(f"[{symbol}] Ошибка scaler.transform: {te} — пропускаю символ.")
+                continue
+
+            # 5️⃣ Финальный вход
+            X_input = pd.concat(
+                [X_scaled.reset_index(drop=True), X_cat.reset_index(drop=True)],
+                axis=1
+            )
+
+            # Катфичи
             if cat_features is None:
                 cat_features = X_input.select_dtypes(include=["object", "category"]).columns.tolist()
 
-            preds, confs = predict_on_batch(model, X_input, cat_features=cat_features)
+            # 6️⃣ Предсказания
+            preds, confidences = predict_on_batch(model, X_input, cat_features=cat_features)
             model_data = {
-                "confidences": confs[-50:],
-                "predictions": preds[-50:]
+                "confidences": confidences[-50:],
+                "predictions": preds[-50:],
             }
 
+            # 7️⃣ Скоринг
             score = compute_pair_score(
                 df=df,
                 model_data=model_data,
                 weights=weights,
-                signal_threshold=signal_threshold
+                signal_threshold=signal_threshold,
             )
 
             if debug:
                 logger.info(f"[✓] {symbol} — Score: {score:.4f}")
 
-            pair_scores.append((symbol, score))
+            pair_scores.append((symbol, float(score)))
 
         except ValueError as e:
             logger.warning(f"[{symbol}] ValueError: {e}")
@@ -195,6 +220,7 @@ def evaluate_pairs(
         except Exception as e:
             logger.exception(f"[{symbol}] Неизвестная ошибка")
 
+    # 8️⃣ Сортировка и сохранение
     sorted_pairs = sorted(pair_scores, key=lambda x: x[1], reverse=True)
     top_pairs = sorted_pairs[:top_n]
 
@@ -204,28 +230,32 @@ def evaluate_pairs(
     if save_results:
         try:
             os.makedirs("outputs", exist_ok=True)
-            pd.DataFrame(sorted_pairs, columns=["symbol", "score"]).to_csv("outputs/top_pairs.csv", index=False)
-            logger.info("[✓] Результаты сохранены в outputs/top_pairs.csv")
+            ts = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M")
+            out_path = f"outputs/top_pairs_{ts}.csv"
+            pd.DataFrame(sorted_pairs, columns=["symbol", "score"]).to_csv(out_path, index=False)
+            logger.info(f"[✓] Результаты сохранены: {out_path}")
         except Exception as e:
             logger.warning(f"[!] Не удалось сохранить файл: {e}")
 
     return top_pairs if return_scores else [s for s, _ in top_pairs]
 
 
-
-def rank_pairs(symbols: List[str], interval: str = "15", top_n: int = 5) -> List[Tuple[str, float]]:
+# ============================================================
+# 🎯 Обёртка: просто топ-N тикеров
+# ============================================================
+def rank_pairs(symbols: List[str], interval: str = "15", top_n: int = 5) -> List[str]:
     return evaluate_pairs(
         symbols=symbols,
         interval=interval,
         top_n=top_n,
-        return_scores=True,  # ✅ теперь так
-        debug=True
+        return_scores=False,
+        debug=True,
     )
 
 
-
+# ============================================================
+# 🔌 Проксируем установку клиента
+# ============================================================
 def set_client(client: HTTP):
-    """
-    Проксирует установку клиента в data_loader (если нужно).
-    """
+    """Передаёт клиент в data_loader для унификации."""
     set_data_client(client)

@@ -58,11 +58,16 @@ def prepare_data(symbol: str, interval: str, threshold: float) -> Tuple[pd.DataF
             smote = SMOTE(random_state=42)
             X_num_res, y_train_res = smote.fit_resample(X_train_num, y_train)
 
-            # Повтор категориальных по новому y_train_res
-            X_cat_res = X_train_cat.loc[y_train_res.index % len(X_train_cat)].reset_index(drop=True)
+            # 🧩 Безопасная репликация категориальных
+            rep = max(1, int(np.ceil(len(y_train_res) / max(1, len(X_train_cat)))))
+            X_cat_rep = pd.concat([X_train_cat] * rep, ignore_index=True).iloc[:len(y_train_res)]
 
-            X_train = pd.concat([pd.DataFrame(X_num_res, columns=num_cols), X_cat_res], axis=1)
+            X_train = pd.concat(
+                [pd.DataFrame(X_num_res, columns=num_cols), X_cat_rep.reset_index(drop=True)],
+                axis=1
+            )
             y_train = y_train_res.reset_index(drop=True)
+
 
         elif RESAMPLING_STRATEGY == "undersample":
             logger.info("[Resampling] Applying RandomUnderSampler on train set")
@@ -78,8 +83,11 @@ def prepare_data(symbol: str, interval: str, threshold: float) -> Tuple[pd.DataF
     X_train_scaled = pd.concat([X_train_scaled, X_train[cat_cols].reset_index(drop=True)], axis=1)
     X_test_scaled = pd.concat([X_test_scaled, X_test[cat_cols].reset_index(drop=True)], axis=1)
 
-    os.makedirs("outputs", exist_ok=True)
-    with open("scaler.pkl", "wb") as f:
+    # всегда сохраняем рядом с model_trainer.py → PROJECT_ROOT/models/scaler.pkl
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    models_dir = os.path.join(base_dir, "models")
+    os.makedirs(models_dir, exist_ok=True)
+    with open(os.path.join(models_dir, "scaler.pkl"), "wb") as f:
         pickle.dump(scaler, f)
 
     return X_train_scaled, X_test_scaled, y_train.reset_index(drop=True), y_test.reset_index(drop=True)
@@ -105,8 +113,17 @@ def optimize_catboost(X_train: pd.DataFrame, y_train: pd.Series) -> dict:
             X_t, X_v = X_train.iloc[train_idx], X_train.iloc[val_idx]
             y_t, y_v = y_train.iloc[train_idx], y_train.iloc[val_idx]
             model = cb.CatBoostClassifier(**params)
-            model.fit(X_t, y_t, eval_set=(X_v, y_v), cat_features=X_t.select_dtypes(include=["category", "object"]).columns.tolist(), early_stopping_rounds=20)
-            score = f1_score(y_v, model.predict(X_v), average="macro")
+            try:
+                model.fit(
+                    X_t, y_t,
+                    eval_set=(X_v, y_v),
+                    cat_features=X_t.select_dtypes(include=["category", "object"]).columns.tolist(),
+                    early_stopping_rounds=20
+                )
+                score = f1_score(y_v, model.predict(X_v), average="macro")
+            except Exception as e:
+                logger.warning(f"[BayesOpt] fold failed: {e}")
+                score = 0.0
             scores.append(score)
         return np.mean(scores)
 
@@ -230,18 +247,47 @@ def train_final_model(X_train: pd.DataFrame, y_train: pd.Series, best_params: di
 
 def load_model_and_scaler(
     model_path="models/saved_model.cbm",
-    scaler_path="scaler.pkl",
+    scaler_path="models/scaler.pkl",
     cat_features_path="models/cat_features.pkl"
 ):
-    """Загружает обученную модель, скейлер и список категориальных признаков"""
+
+    """
+    Загружает обученную модель, скейлер и список категориальных признаков.
+    Работает независимо от текущей директории (использует абсолютные пути).
+    """
+    import os
+    import pickle
+    import catboost as cb
+
+    # Определяем абсолютные пути
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(base_dir, model_path)
+    scaler_path = os.path.join(base_dir, scaler_path)
+    cat_features_path = os.path.join(base_dir, cat_features_path)
+
+    # Проверяем наличие файлов
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"❌ Model file not found: {model_path}")
+    if not os.path.exists(scaler_path):
+        raise FileNotFoundError(f"❌ Scaler file not found: {scaler_path}")
+    if not os.path.exists(cat_features_path):
+        raise FileNotFoundError(f"❌ Cat features file not found: {cat_features_path}")
+
+    # Загружаем модель
     model = cb.CatBoostClassifier()
     model.load_model(model_path)
 
+    # Загружаем скейлер
     with open(scaler_path, "rb") as f:
         scaler = pickle.load(f)
 
+    # Загружаем категориальные признаки
     with open(cat_features_path, "rb") as f:
         cat_features = pickle.load(f)
+
+    print(f"[DEBUG] Загружена модель: {os.path.basename(model_path)}")
+    print(f"[DEBUG] Загружен скейлер: {os.path.basename(scaler_path)}")
+    print(f"[DEBUG] Загружены cat_features ({len(cat_features)}): {cat_features}")
 
     return model, scaler, cat_features
 
@@ -249,30 +295,27 @@ def load_model_and_scaler(
 
 def predict_on_batch(model, X_input, cat_features=None):
     """
-    Выполняет предсказание и возвращает классы и уверенность (вероятность положительного класса).
-
-    Параметры:
-        model: Обученная модель CatBoost
-        X_input (pd.DataFrame): Входные признаки
-        cat_features (list, optional): Список категориальных признаков (по именам)
+    Выполняет предсказание и возвращает классы и уверенность (макс. вероятность по строке).
 
     Возвращает:
-        preds (List): Список предсказанных классов
-        confidences (List): Уверенность модели (вероятности положительного класса)
+        preds (List[int]): предсказанные классы
+        confidences (List[float]): уверенность (max(prob) по строке)
     """
+    import numpy as np
+    import catboost as cb
+
+    # Индексы категориальных (если список имён передали)
+    cat_idx = None
     if cat_features is not None:
-        cat_feature_indices = [X_input.columns.get_loc(col) for col in cat_features]
-    else:
-        cat_feature_indices = None
+        cat_idx = [X_input.columns.get_loc(c) for c in cat_features]
 
-    pool = cb.Pool(X_input, cat_features=cat_feature_indices)
+    pool = cb.Pool(X_input, cat_features=cat_idx)
 
-    preds = model.predict(pool)
-    probs = model.predict_proba(pool)
+    probs = model.predict_proba(pool)             # shape (n, C)
+    preds = model.predict(pool)                   # CatBoost возвращает shape (n,1) или (n,)
+    preds = np.array(preds).astype(int).ravel().tolist()
 
-    # ⚠️ Возьми только вероятность положительного класса (обычно класс 1)
-    confidences = [p[1] for p in probs]
+    # ✅ Уверенность — максимум вероятности по каждой строке
+    confs = np.max(probs, axis=1).tolist()
 
-    return preds.tolist(), confidences
-
-
+    return preds, confs
