@@ -14,8 +14,10 @@ from data_loader import fetch_ohlcv
 from model_trainer import load_model_and_scaler, predict_on_batch
 from data_loader import set_client as set_data_client
 
-logger = logging.getLogger(__name__)
+# ✅ Калибровка уверенности (из Experiment Pack v1)
+from confidence_calibrator import load_calibrator, apply_calibration
 
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # 🧮 Основная функция скоринга пары
@@ -60,22 +62,36 @@ def compute_pair_score(
         atr = talib.ATR(high, low, close, timeperiod=14).fillna(0).iloc[-1]
         ema_fast = EMAIndicator(close, window=5).ema_indicator()
         ema_slow = EMAIndicator(close, window=20).ema_indicator()
+
         safe_close = close.replace(0, np.nan).fillna(method="bfill")
         ema_diff = abs((ema_fast - ema_slow) / safe_close).fillna(0).iloc[-1]
         adx = talib.ADX(high, low, close, timeperiod=14).fillna(0).iloc[-1]
 
         # --- Модельные метрики ---
         confidences = pd.Series(model_data["confidences"]).astype(float).fillna(0.0)
-        signals_count = int((confidences >= signal_threshold).sum())
         mean_conf = float(confidences.mean())
         std_conf = float(confidences.std())
 
         # --- Нормализация ---
-        norm_volume = min(float(avg_volume) / 1_000_000.0, 2.0)
-        norm_atr = min(float(atr) / float(close.iloc[-1]), 0.05) * 100.0
-        norm_ema = min(float(ema_diff), 0.05) * 100.0
-        norm_adx = min(float(adx) / 50.0, 1.0)
-        norm_signals = min(signals_count / 10.0, 1.0)
+        last_close = float(close.iloc[-1])
+        eps = 1e-12
+        norm_volume  = min(float(avg_volume) / 1_000_000.0, 2.0)
+        norm_atr     = min(float(atr) / max(last_close, eps), 0.05) * 100.0
+        norm_ema     = min(float(ema_diff), 0.05) * 100.0
+        norm_adx     = min(float(adx) / 50.0, 1.0)
+
+        # --- Адаптивный порог сигналов (мягкий) ---
+        base_th = float(signal_threshold)
+        adj = 0.0
+        if norm_adx >= 0.6:   # ADX ~30+
+            adj -= 0.03
+        if norm_atr <= 1.0:   # очень низкая ATR%
+            adj += 0.02
+        signal_th_eff = min(max(base_th + adj, 0.50), 0.80)
+
+        # Счётчик confident-сигналов по калиброванной уверенности
+        signals_count = int((confidences >= signal_th_eff).sum())
+        norm_signals  = min(signals_count / 10.0, 1.0)
 
         # --- Финальный скор ---
         score = (
@@ -99,6 +115,7 @@ def compute_pair_score(
                     "norm_signals": round(norm_signals, 4),
                     "mean_conf": round(mean_conf, 4),
                     "std_conf": round(std_conf, 4),
+                    "signal_th_eff": round(signal_th_eff, 3),
                     "score": score,
                 }
             )
@@ -111,7 +128,6 @@ def compute_pair_score(
     except Exception as e:
         logger.warning(f"[Score] Ошибка при расчёте score: {e}")
         return 0.0 if not return_details else (0.0, {"error": str(e)})
-
 
 # ============================================================
 # 🧠 Оценка нескольких пар (основная логика)
@@ -136,35 +152,34 @@ def evaluate_pairs(
     if model is None or scaler is None:
         model, scaler, cat_features = load_model_and_scaler()
     else:
-        cat_features = None
+        cat_features = None  # внешние артефакты переданы — cat_features определим по входу
+
+    # ✅ Калибратор — грузим один раз
+    calibrator = load_calibrator("models/confidence_calibrator.pkl")
 
     pair_scores: List[Tuple[str, float]] = []
-
     from feature_engineering import select_features
 
     for symbol in symbols:
         try:
-            # 1️⃣ Данные: сырые свечи
+            # 1) Данные: сырые свечи
             df = fetch_ohlcv(symbol, interval, limit=max(window, 60)).tail(window)
 
-            # 2️⃣ Генерация признаков
+            # 2) Генерация признаков
             X, _ = select_features(df)
-
-            # Ранние проверки
             if X.empty:
                 if debug:
-                    logger.warning(f"[{symbol}] Пустой набор признаков после feature engineering — пропускаю.")
+                    logger.warning(f"[{symbol}] Пустой набор признаков — пропускаю.")
                 continue
 
             X_cat = X.select_dtypes(include=["object", "category"])
             X_num = X.select_dtypes(include=["number"])
-
             if X_num.empty:
                 if debug:
-                    logger.warning(f"[{symbol}] Нет числовых признаков (X_num.empty) — пропускаю.")
+                    logger.warning(f"[{symbol}] Нет числовых признаков — пропускаю.")
                 continue
 
-            # 3️⃣ Выравнивание под scaler.feature_names_in_
+            # 3) Выравнивание под scaler.feature_names_in_
             if hasattr(scaler, "feature_names_in_"):
                 for col in scaler.feature_names_in_:
                     if col not in X_num.columns:
@@ -172,7 +187,7 @@ def evaluate_pairs(
                 keep_order = [c for c in scaler.feature_names_in_ if c in X_num.columns]
                 X_num = X_num.loc[:, keep_order]
 
-            # 4️⃣ Скейлинг
+            # 4) Скейлинг
             try:
                 X_scaled = pd.DataFrame(
                     scaler.transform(X_num),
@@ -180,27 +195,41 @@ def evaluate_pairs(
                     index=X_num.index
                 )
             except Exception as te:
-                logger.warning(f"[{symbol}] Ошибка scaler.transform: {te} — пропускаю символ.")
+                logger.warning(f"[{symbol}] Ошибка scaler.transform: {te} — пропускаю.")
                 continue
 
-            # 5️⃣ Финальный вход
+            # 5) Финальный вход
             X_input = pd.concat(
                 [X_scaled.reset_index(drop=True), X_cat.reset_index(drop=True)],
                 axis=1
             )
 
-            # Катфичи
-            if cat_features is None:
-                cat_features = X_input.select_dtypes(include=["object", "category"]).columns.tolist()
+            # ✅ Катфичи — определяем ДЛЯ КАЖДОГО СИМВОЛА по фактическому входу
+            current_cat_features = (
+                X_input.select_dtypes(include=["object", "category"]).columns.tolist()
+                if cat_features is None else cat_features
+            )
 
-            # 6️⃣ Предсказания
-            preds, confidences = predict_on_batch(model, X_input, cat_features=cat_features)
+            # 6) Предсказания
+            preds, confidences = predict_on_batch(
+                model, X_input, cat_features=current_cat_features
+            )
+
+            # ✅ Гарантируем 1D-вектор confidences и применяем калибровку
+            conf_arr = np.asarray(confidences)
+            if conf_arr.ndim == 2:
+                conf_arr = conf_arr.max(axis=1)
+            elif conf_arr.ndim == 0:
+                conf_arr = np.array([float(conf_arr)])
+            conf_arr = apply_calibration(calibrator, conf_arr)
+            confidences = conf_arr.tolist()
+
             model_data = {
                 "confidences": confidences[-50:],
-                "predictions": preds[-50:],
+                "predictions": np.asarray(preds).astype(int).ravel().tolist()[-50:],
             }
 
-            # 7️⃣ Скоринг
+            # 7) Скоринг
             score = compute_pair_score(
                 df=df,
                 model_data=model_data,
@@ -217,10 +246,10 @@ def evaluate_pairs(
             logger.warning(f"[{symbol}] ValueError: {e}")
         except KeyError as e:
             logger.warning(f"[{symbol}] KeyError: отсутствует колонка {e}")
-        except Exception as e:
+        except Exception:
             logger.exception(f"[{symbol}] Неизвестная ошибка")
 
-    # 8️⃣ Сортировка и сохранение
+    # 8) Сортировка и сохранение
     sorted_pairs = sorted(pair_scores, key=lambda x: x[1], reverse=True)
     top_pairs = sorted_pairs[:top_n]
 
@@ -239,7 +268,6 @@ def evaluate_pairs(
 
     return top_pairs if return_scores else [s for s, _ in top_pairs]
 
-
 # ============================================================
 # 🎯 Обёртка: просто топ-N тикеров
 # ============================================================
@@ -251,7 +279,6 @@ def rank_pairs(symbols: List[str], interval: str = "15", top_n: int = 5) -> List
         return_scores=False,
         debug=True,
     )
-
 
 # ============================================================
 # 🔌 Проксируем установку клиента

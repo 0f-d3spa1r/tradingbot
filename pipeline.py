@@ -34,39 +34,58 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 MODEL_DIR.mkdir(exist_ok=True)
 
 
-def evaluate_model(model: cb.CatBoostClassifier, X_test, y_test, symbol: str, ts: str):
-    """Считаем метрики, пишем отчёты и картинки с уникальными именами."""
+def evaluate_model(model, X_test, y_test, symbol="model", ts=None):
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import accuracy_score, classification_report, f1_score, ConfusionMatrixDisplay
+    from confidence_calibrator import fit_confidence_calibrator, save_calibrator
+
+    tag = f"{symbol}" if ts is None else f"{symbol}_{ts}"
+
     proba = model.predict_proba(X_test)
     confidence = np.max(proba, axis=1)
     y_pred = np.argmax(proba, axis=1)
 
-    logger.info("=" * 30 + f" [FINAL METRICS] {symbol} " + "=" * 30)
+    logger.info("=" * 30 + f" [FINAL METRICS] {tag} " + "=" * 30)
     logger.info("[All] Accuracy: %.4f", accuracy_score(y_test, y_pred))
-    logger.info("[All] F1 macro: %.4f", f1_score(y_test, y_pred, average="macro"))
+    logger.info("[All] F1 macro: %.4f", f1_score(y_test, y_pred, average='macro'))
 
     labels_order = [0, 1, 2]
     target_names = ["Down", "Up", "Neutral"]
     report = classification_report(
         y_test, y_pred, labels=labels_order, target_names=target_names, zero_division=0
     )
-    (OUTPUT_DIR / f"{symbol}_{ts}_report.txt").write_text(report)
+    (OUTPUT_DIR / f"{tag}_report.txt").write_text(report)
 
-    ConfusionMatrixDisplay.from_predictions(y_test, y_pred, cmap="viridis")
-    plt.title(f"Confusion Matrix ({symbol})")
-    plt.savefig(OUTPUT_DIR / f"{symbol}_{ts}_confusion_matrix.png")
+    ConfusionMatrixDisplay.from_predictions(y_test, y_pred, cmap='viridis')
+    plt.title(f"Confusion Matrix ({tag})")
+    plt.savefig(OUTPUT_DIR / f"conf_matrix_{tag}.png")
     plt.close()
 
-    # метрики по порогам уверенности
-    for thr in CONFIDENCE_THRESHOLDS:
-        idx = confidence >= thr
-        if np.any(idx):
-            acc = accuracy_score(y_test[idx], y_pred[idx])
-            f1 = f1_score(y_test[idx], y_pred[idx], average="macro")
-            logger.info(f"[Conf >= {thr:.2f}] Accuracy: {acc:.4f}, F1_macro: {f1:.4f}")
-        else:
-            logger.warning(f"Нет уверенных прогнозов при пороге {thr:.2f}")
+    # === Калибратор уверенности (на holdout) ===
+    try:
+        is_correct = (y_pred == np.asarray(y_test)).astype(int)
+        ir = fit_confidence_calibrator(confidence, is_correct)
+        save_calibrator(ir, path="models/confidence_calibrator.pkl")
+        logger.info("Saved confidence calibrator to models/confidence_calibrator.pkl")
+    except Exception as e:
+        logger.warning(f"Confidence calibrator not saved: {e}")
 
-    # важности признаков (колонки CatBoost могут отличаться по названию — подстрахуемся)
+    # Пороговые метрики (НЕ калиброванные, для сопоставимости)
+    from config import CONFIDENCE_THRESHOLDS
+    for threshold in CONFIDENCE_THRESHOLDS:
+        confident_idx = confidence >= threshold
+        y_conf = y_pred[confident_idx]
+        y_test_conf = np.asarray(y_test)[confident_idx]
+        if len(y_conf) > 0:
+            acc = accuracy_score(y_test_conf, y_conf)
+            f1 = f1_score(y_test_conf, y_conf, average='macro')
+            logger.info(f"[Conf >= {threshold:.2f}] Accuracy: {acc:.4f}")
+            logger.info(f"[Conf >= {threshold:.2f}] F1 macro: {f1:.4f}")
+        else:
+            logger.warning(f"Нет уверенных прогнозов при пороге {threshold:.2f}")
+
+    # Устойчивое построение feature importance (разные версии CatBoost)
     importances = model.get_feature_importance(prettified=True)
     plt.figure(figsize=(10, 6))
     feat_col = "Feature Id" if "Feature Id" in importances.columns else (
@@ -76,8 +95,9 @@ def evaluate_model(model: cb.CatBoostClassifier, X_test, y_test, symbol: str, ts
     plt.barh(importances[feat_col], importances[val_col])
     plt.title("CatBoost Feature Importances")
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / f"{symbol}_{ts}_feature_importance.png")
+    plt.savefig(OUTPUT_DIR / f"feature_importance_{tag}.png")
     plt.close()
+
 
 
 def _timestamp() -> str:
