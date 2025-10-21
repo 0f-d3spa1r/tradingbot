@@ -1,7 +1,9 @@
 ---
+title: "TradingBot — v0.2.0-dev"
+---
 
-```markdown
 # 🤖 TradingBot — v0.2.0-dev
+
 
 Algo-bot on CatBoost: OHLCV fetching (Bybit/Pybit), feature generation (TA indicators, candlesticks, time, clustering), training with Bayesian optimization, liquid-pair filtering and scoring (volume/ATR/EMA/ADX + signal quality).  
 Includes confidence calibration and a set of smoke tests.
