@@ -113,3 +113,5 @@ optuna_studies/
 
 # Byte-compiled + debug
 cython_debug/
+tests/models/
+tests/outputs/

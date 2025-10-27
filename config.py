@@ -17,8 +17,13 @@ BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET") or ""
 REQUIRE_API_KEYS: bool = False  # выставляй True в рантайме, False — при оффлайн обучении/тестах
 
 # ---------------- Training / ML ----------------
-USE_RESAMPLING: bool = True
-RESAMPLING_STRATEGY: Literal["smote", "undersample", "none"] = "smote"
+USE_RESAMPLING: bool = False                # 🚫 отключаем SMOTE по умолчанию
+RESAMPLING_STRATEGY: Literal["smote", "undersample", "none"] = "none"
+
+# Включаем класс-весы вместо SMOTE
+USE_CLASS_WEIGHTS: bool = True              # ✅ включить балансировку через веса
+CLASS_WEIGHT_MODE: Literal["balanced", "none"] = "balanced"
+
 
 # Пороги уверенности (используются в отчётах/фильтрах сигналов)
 CONFIDENCE_THRESHOLDS: List[float] = [0.5, 0.6, 0.7]
@@ -126,3 +131,27 @@ def get_settings() -> Settings:
     )
     s.validate()
     return s
+
+
+# --- CV / Validation ---
+EMBARGO_BARS: int = 60        # уже используется в BayesOpt/purged CV
+# Для rolling CV (sanity) — можно использовать тот же эмбарго
+EMBARGO_BARS_ROLLING: int = EMBARGO_BARS
+
+# Минимальные размеры выборок на фолде (чтобы не оптимизировать по шуму)
+MIN_CV_TRAIN: int = 120          # минимальный размер train в фолде
+MIN_CV_VAL: int = 150            # минимальный размер val в фолде
+N_SPLITS_BO: int = 2             # число фолдов в байес-опте
+
+# Минимальные размеры окон в rolling CV (чтобы не мерить шум)
+MIN_ROLL_TRAIN: int = 300
+MIN_ROLL_TEST: int = 100
+
+# --- Calibration / regularization ---
+TEMPERATURE_SCALING: bool = True           # включить temperature scaling на holdout
+TEMPERATURE_MIN: float = 0.8               # минимум T
+TEMPERATURE_MAX: float = 2.0               # максимум T
+TEMPERATURE_STEP: float = 0.1              # шаг перебора T
+
+# --- (опционально) лёгкий feature bagging на финальном фите ---
+FEATURE_BAGGING_FRAC = None
