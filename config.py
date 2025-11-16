@@ -26,7 +26,7 @@ CLASS_WEIGHT_MODE: Literal["balanced", "none"] = "balanced"
 
 
 # Пороги уверенности (используются в отчётах/фильтрах сигналов)
-CONFIDENCE_THRESHOLDS: List[float] = [0.5, 0.6, 0.7]
+CONFIDENCE_THRESHOLDS = [0.50, 0.60, 0.70]
 
 # ---------------- Pair Finder ----------------
 MIN_HISTORY_BARS: int = 200
@@ -150,8 +150,8 @@ MIN_ROLL_TEST: int = 100
 # --- Calibration / regularization ---
 TEMPERATURE_SCALING: bool = True           # включить temperature scaling на holdout
 TEMPERATURE_MIN: float = 0.8               # минимум T
-TEMPERATURE_MAX: float = 2.0               # максимум T
+TEMPERATURE_MAX: float = 3.0               # максимум T
 TEMPERATURE_STEP: float = 0.1              # шаг перебора T
 
 # --- (опционально) лёгкий feature bagging на финальном фите ---
-FEATURE_BAGGING_FRAC = None
+FEATURE_BAGGING_FRAC: float | None = 0.95  # None to disable; 0.95 keeps 95% random features

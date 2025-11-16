@@ -115,3 +115,4 @@ optuna_studies/
 cython_debug/
 tests/models/
 tests/outputs/
+catboost_info/

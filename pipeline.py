@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import catboost as cb
 from sklearn.metrics import (
     accuracy_score, classification_report, f1_score,
-    ConfusionMatrixDisplay
+    ConfusionMatrixDisplay, precision_score
 )
 
 from pybit.unified_trading import HTTP
@@ -23,12 +23,13 @@ from model_trainer import (
     prepare_data,
     optimize_catboost,
     train_final_model,
-    rolling_cross_validation,
+    rolling_cross_validation, _atomic_write_text,
 )
 from confidence_calibrator import fit_confidence_calibrator, save_calibrator
 import json
 from datetime import datetime
 from config import EMBARGO_BARS, MIN_CV_TRAIN, MIN_CV_VAL
+from model_trainer import _sanitize_categoricals
 
 
 
@@ -46,40 +47,6 @@ MODEL_DIR.mkdir(exist_ok=True)
 import pickle
 import catboost as cb
 
-def _align_for_infer(df: pd.DataFrame) -> tuple[pd.DataFrame, list[int]]:
-    """
-    Приводит входной DF к тому же набору/порядку признаков, что и при обучении:
-    - пробует загрузить models/feature_columns.pkl (если делался feature bagging)
-    - фильтрует/переупорядочивает столбцы
-    - санитизирует категориальные (string + fillna("__NA__"))
-    - возвращает df_aligned и индексы cat_features для CatBoost Pool
-    """
-    keep_cols = None
-    try:
-        with open("models/feature_columns.pkl", "rb") as f:
-            keep_cols = pickle.load(f)
-    except Exception:
-        keep_cols = df.columns.tolist()
-        logger.warning("[InferAlign] models/feature_columns.pkl not found — using current columns order")
-
-    # filter + reorder
-    cols = [c for c in keep_cols if c in df.columns]
-    if len(cols) < len(keep_cols):
-        missing = [c for c in keep_cols if c not in df.columns]
-        logger.warning("[InferAlign] %d feature(s) missing in input: %s", len(missing), missing[:10])
-
-    df2 = df[cols].copy()
-
-    # sanitize categoricals
-    cat_cols = df2.select_dtypes(include=["object", "category", "string"]).columns.tolist()
-    if cat_cols:
-        df2[cat_cols] = df2[cat_cols].astype("string").fillna("__NA__")
-
-    cat_idx = [df2.columns.get_loc(c) for c in cat_cols]
-    logger.info("[InferAlign] kept %d features; cat=%d", len(cols), len(cat_idx))
-    return df2, cat_idx
-
-
 
 def _apply_temperature_scaling(proba: np.ndarray, T: float) -> np.ndarray:
     """Softmax temperature scaling for multi-class, from probabilities (logit-free)."""
@@ -90,8 +57,28 @@ def _apply_temperature_scaling(proba: np.ndarray, T: float) -> np.ndarray:
     return exp / np.sum(exp, axis=1, keepdims=True)
 
 def _nll_multiclass(y_true: np.ndarray, proba: np.ndarray) -> float:
-    p = np.clip(proba[np.arange(len(y_true)), y_true], 1e-12, 1.0)
+    """
+    NLL для мульти-класса, устойчивый к ситуации,
+    когда модель вернула меньше классов, чем есть в глобальной разметке.
+    Игнорируем объекты, для которых y_true >= proba.shape[1].
+    """
+    y_true = np.asarray(y_true, dtype=int)
+    proba = np.asarray(proba, dtype=float)
+
+    n_classes = proba.shape[1]
+    valid_mask = (y_true >= 0) & (y_true < n_classes)
+
+    if not np.any(valid_mask):
+        # нет ни одного объекта с меткой, попадающей в диапазон предсказанных классов
+        # возвращаем большой NLL, чтобы такой T точно не стал «лучшим»
+        return 1e9
+
+    yv = y_true[valid_mask]
+    pv = proba[valid_mask]
+
+    p = np.clip(pv[np.arange(len(yv)), yv], 1e-12, 1.0)
     return float(-np.mean(np.log(p)))
+
 
 def _find_best_temperature(proba_val: np.ndarray, y_val: np.ndarray,
                            t_min: float, t_max: float, t_step: float) -> float:
@@ -163,7 +150,6 @@ def _load_feature_and_cat_lists(symbol: str | None = None):
 
     return feat_cols, cat_list
 
-
 def _align_for_infer(X: pd.DataFrame, symbol: str | None = None):
     """
     Делает входной X совместимым с моделью:
@@ -180,15 +166,21 @@ def _align_for_infer(X: pd.DataFrame, symbol: str | None = None):
     # если список колонок не найден — используем то, что пришло (но это риск!)
     if feat_cols is None:
         feat_cols = X_in.columns.tolist()
+        logger.warning(
+            "[AlignInfer] feature_columns.pkl не найден → используем входные колонки как есть (⚠ риск рассинхрона)"
+        )
 
     # 2) гарантируем наличие всех нужных колонок
-    #    отсутствующие — создаём (числовые -> 0.0; категориальные -> "__NA__")
     exist_cols = set(X_in.columns)
     need_cols = list(feat_cols)
 
     # если список cat_features не найден — определим по dtype входного X (best-effort)
     if cat_features is None:
         cat_features = X_in.select_dtypes(include=["object", "category", "string"]).columns.tolist()
+        logger.warning(
+            "[AlignInfer] cat_features.pkl не найден → fallback по dtype=%s (⚠ int-категориальные не будут определены)",
+            cat_features[:10]
+        )
 
     cat_set = set(cat_features)
 
@@ -202,216 +194,121 @@ def _align_for_infer(X: pd.DataFrame, symbol: str | None = None):
     # 3) режем лишние колонки и ставим ПРАВИЛЬНЫЙ ПОРЯДОК
     X_in = X_in[need_cols]
 
-    # 4) санитизация категориальных
+    # 4) санитизация категориальных (string + fillna("__NA__"))
     cat_cols_present = [c for c in cat_features if c in X_in.columns]
     if cat_cols_present:
-        X_in[cat_cols_present] = X_in[cat_cols_present].astype("string").fillna("__NA__")
+        X_in.loc[:, cat_cols_present] = X_in.loc[:, cat_cols_present].astype("string").fillna("__NA__")
 
     # 5) индексы категориальных (CatBoost ожидает индексы/позиции)
     cat_idx = [X_in.columns.get_loc(c) for c in cat_cols_present]
 
+    logger.info(
+        "[AlignInfer] aligned %d features (added=%d, cats=%d)",
+        len(need_cols),
+        len(set(need_cols) - exist_cols),
+        len(cat_idx)
+    )
+
     return X_in, cat_idx
 
-def evaluate_model(model, X_test, y_test, symbol="model", ts=None, calib=None):
+
+logger = logging.getLogger(__name__)
+
+def find_threshold_for_precision(
+    y_true,
+    proba,
+    target_precision: float = 0.6,
+    calibrator=None,
+    T: float = 1.0,
+    thresholds: np.ndarray | None = None,
+):
     """
-    Оценивает модель на тесте (eval) и, если передан calib=(X_hold, y_hold),
-    подбирает Temperature T на holdout (по NLL), применяет его, обучает изотонический
-    калибратор уверенности на holdout и сохраняет и калибратор, и T.
+    Находит МИНИМАЛЬНЫЙ порог по КАЛИБРОВАННОЙ уверенности, при котором macro-precision >= target_precision.
+    Последовательность соответствует прод-логике:
+        proba -> Temperature (T) -> max(prob) -> Isotonic (если есть)
+
+    Параметры:
+      y_true        : true labels (array-like)
+      proba         : вероятности (n_samples x n_classes)
+      target_precision : целевой macro-precision
+      calibrator    : sklearn.isotonic.IsotonicRegression (или None)
+      T             : температура (float)
+      thresholds    : np.ndarray порогов; если None -> linspace(0.90..0.30, шаг ≈ 0.05)
+
+    Возвращает:
+      (threshold, coverage)  — если найден порог; иначе (None, 0.0)
     """
-    from config import (
-        CONFIDENCE_THRESHOLDS,
-        TEMPERATURE_SCALING, TEMPERATURE_MIN, TEMPERATURE_MAX, TEMPERATURE_STEP,
-    )
+    # --- валидация входа
+    if proba is None or y_true is None:
+        logger.warning("[find_threshold_for_precision] y_true/proba is None — returning (None, 0.0)")
+        return None, 0.0
 
-    tag = f"{symbol}" + (f"_{ts}" if ts else "")
-    run_dir = MODEL_DIR / symbol / (ts if ts else "")
-    run_dir.mkdir(parents=True, exist_ok=True)
+    y_true = np.asarray(y_true)
+    proba = np.asarray(proba)
 
-    # --- локальный хелпер для диагностики уверенности
-    def _log_conf_stats(name: str, proba: np.ndarray):
-        conf = proba.max(axis=1)
-        logger.info("[%s] mean_conf=%.3f | p90=%.3f | p95=%.3f | max=%.3f",
-                    name,
-                    float(conf.mean()),
-                    float(np.quantile(conf, 0.90)),
-                    float(np.quantile(conf, 0.95)),
-                    float(conf.max()))
+    if y_true.size == 0 or proba.size == 0:
+        logger.warning("[find_threshold_for_precision] Empty input — returning (None, 0.0)")
+        return None, 0.0
 
-    # =========================
-    # 1) Temperature: подобрать по HOLDOUT (если есть)
-    # =========================
-    best_T = 1.0
-    proba_hold = None
-    y_hold_np = None
+    if y_true.shape[0] != proba.shape[0]:
+        n = min(y_true.shape[0], proba.shape[0])
+        logger.warning("[find_threshold_for_precision] Length mismatch (y=%d, p=%d) → truncated to %d",
+                       y_true.shape[0], proba.shape[0], n)
+        y_true = y_true[:n]
+        proba = proba[:n]
 
-    if calib is not None:
-        X_hold, y_hold = calib
+    # --- Temperature scaling
+    proba_T = _apply_temperature_scaling(proba, T)  # используй вашу реализацию из pipeline
+    conf = proba_T.max(axis=1)
+    y_pred = proba_T.argmax(axis=1)
 
-        # 1.1 Выравнивание HOLDOUT под обучающий пайплайн (порядок фич, cat idx)
-        X_hold_aligned, cat_idx_hold = _align_for_infer(X_hold)
-        pool_hold = cb.Pool(X_hold_aligned, cat_features=cat_idx_hold)
-
-        # 1.2 Вероятности на holdout до T
-        proba_hold_raw = np.asarray(model.predict_proba(pool_hold))
-        y_hold_np = np.asarray(y_hold).astype(int)
-
-        _log_conf_stats("HOLD raw", proba_hold_raw)
-
-        # 1.3 Подбор T по NLL (если включено и данных достаточно)
-        if TEMPERATURE_SCALING and len(y_hold_np) >= 30:
-            # ограничим максимум T (если в конфиге так задано)
-            T_min = float(TEMPERATURE_MIN)
-            T_max = float(TEMPERATURE_MAX)
-            T_step = float(TEMPERATURE_STEP)
-
-            best_T = _find_best_temperature(proba_hold_raw, y_hold_np, T_min, T_max, T_step)
-            logger.info("Temperature scaling: candidate T=%.2f (chosen on holdout by NLL)", best_T)
-
-        # 1.4 Применяем T и делаем «safeguard»: если T ухудшил macro-F1 на holdout — откатываемся
-        y_pred_hold_raw = proba_hold_raw.argmax(axis=1).astype(int)
-        f1m_raw = f1_score(y_hold_np, y_pred_hold_raw, average="macro")
-
-        proba_hold_T = _apply_temperature_scaling(proba_hold_raw, best_T)
-        y_pred_hold_T = proba_hold_T.argmax(axis=1).astype(int)
-        f1m_T = f1_score(y_hold_np, y_pred_hold_T, average="macro")
-
-        if f1m_T + 1e-9 < f1m_raw - 0.01:  # допускаем незначительное колебание
-            logger.info("Temperature rollback: F1 holdout decreased (raw=%.4f -> T=%.4f). Using T=1.0",
-                        f1m_raw, f1m_T)
-            best_T = 1.0
-            proba_hold = proba_hold_raw
-        else:
-            proba_hold = proba_hold_T
-
-        _log_conf_stats("HOLD T", proba_hold)
-
-        # 1.5 Сохраняем T (и алиасы)
+    # --- Isotonic calibration (по уверенности)
+    if calibrator is not None:
         try:
-            (run_dir / "temperature.json").write_text(json.dumps({"T": best_T}))
-            (MODEL_DIR / f"temperature_{symbol}.json").write_text(json.dumps({"T": best_T}))
-            (MODEL_DIR / "temperature.json").write_text(json.dumps({"T": best_T}))
+            # ваша helper-функция калибровки: должна вернуть np.ndarray в [0, 1]
+            from model_trainer import apply_isotonic_confidence  # если уже импортирована выше — можно убрать
+            conf = apply_isotonic_confidence(calibrator, conf)
         except Exception as e:
-            logger.warning("Failed to save temperature.json: %s", e)
+            logger.warning("[find_threshold_for_precision] Isotonic failed (%s) — using raw confidence", e)
 
-    # =========================
-    # 2) Оценка на TEST (eval), уже с применённым T
-    # =========================
-    # 2.1 Выравнивание TEST под обучающий пайплайн
-    X_test_aligned, cat_idx_test = _align_for_infer(X_test)
-    pool_test = cb.Pool(X_test_aligned, cat_features=cat_idx_test)
+    # --- сетка порогов
+    if thresholds is None:
+        thresholds = np.linspace(0.90, 0.30, 13)
 
-    # 2.2 Вероятности на eval + temperature
-    proba_eval = np.asarray(model.predict_proba(pool_test))
-    proba_eval = _apply_temperature_scaling(proba_eval, best_T)
-    _log_conf_stats("EVAL T", proba_eval)
+    best_prec = -1.0
+    best_th = None
+    best_cov = 0.0
 
-    y_test_np   = np.asarray(y_test).astype(int)
-    y_pred_eval = proba_eval.argmax(axis=1).astype(int)
-    conf_eval   = proba_eval.max(axis=1)
+    for th in thresholds:
+        m = conf >= th
+        if not m.any():
+            continue
+        prec = precision_score(y_true[m], y_pred[m], average="macro", zero_division=0)
+        cov = float(m.mean())
 
-    logger.info("=" * 30 + f" [FINAL METRICS] {tag} " + "=" * 30)
-    acc_eval = accuracy_score(y_test_np, y_pred_eval)
-    f1m_eval = f1_score(y_test_np, y_pred_eval, average='macro')
-    logger.info("[All] Accuracy: %.4f", acc_eval)
-    logger.info("[All] F1 macro: %.4f", f1m_eval)
+        if prec >= target_precision:
+            logger.info("[Auto-threshold] target_precision=%.2f → th=%.2f | precision=%.3f | coverage=%.3f",
+                        target_precision, th, prec, cov)
+            return float(th), cov
 
-    # per-class F1 (диагностика)
-    try:
-        from sklearn.metrics import precision_recall_fscore_support
-        _, _, f1_per_cls, _ = precision_recall_fscore_support(
-            y_test_np, y_pred_eval, labels=[0, 1, 2], zero_division=0
-        )
-        logger.info("[Eval per-class] F1: Down=%.3f | Up=%.3f | Neutral=%.3f",
-                    f1_per_cls[0], f1_per_cls[1], f1_per_cls[2])
-    except Exception:
-        pass
+        if prec > best_prec:
+            best_prec, best_th, best_cov = float(prec), float(th), cov
 
-    # 2.3 Отчёты и графики по eval
-    labels_order = [0, 1, 2]
-    target_names = ["Down", "Up", "Neutral"]
-    report = classification_report(
-        y_test_np, y_pred_eval, labels=labels_order, target_names=target_names, zero_division=0
-    )
-    (OUTPUT_DIR / f"{tag}_report.txt").write_text(report)
-
-    ConfusionMatrixDisplay.from_predictions(y_test_np, y_pred_eval, cmap='viridis')
-    plt.title(f"Confusion Matrix ({tag})")
-    plt.savefig(OUTPUT_DIR / f"conf_matrix_{tag}.png")
-    plt.close()
-
-    # уверенные предсказания на eval (+ coverage в лог)
-    for th in CONFIDENCE_THRESHOLDS:
-        mask = conf_eval >= th
-        coverage = float(mask.mean())
-        if mask.any():
-            acc = accuracy_score(y_test_np[mask], y_pred_eval[mask])
-            f1m = f1_score(y_test_np[mask], y_pred_eval[mask], average='macro')
-            logger.info(f"[Conf >= {th:.2f}] Coverage: {coverage:.3f} | Acc: {acc:.4f} | F1 macro: {f1m:.4f}")
-        else:
-            logger.warning(f"[Conf >= {th:.2f}] Coverage: 0.000 — нет уверенных прогнозов")
-
-    # гистограммы уверенности на eval (по классам, уже после T)
-    try:
-        plt.figure(figsize=(8, 5))
-        for cls, name in zip([0, 1, 2], ["Down", "Up", "Neutral"]):
-            if np.any(y_test_np == cls):
-                plt.hist(conf_eval[y_test_np == cls], bins=30, alpha=0.5, label=name)
-        plt.legend()
-        plt.title(f"Confidence distribution (eval) — {symbol}")
-        out_hist = OUTPUT_DIR / f"conf_dist_{symbol}_{ts or 'run'}.png"
-        plt.tight_layout()
-        plt.savefig(out_hist)
-        plt.close()
-        logger.info("Saved confidence hist: %s", out_hist)
-    except Exception as e:
-        logger.warning("Failed to save confidence hist: %s", e)
-    # =========================
-    # 3) Поиск оптимального порога по precision
-    # =========================
-    try:
-        th_auto, cov_auto = find_threshold_for_precision(y_test_np, proba_eval, target_precision=0.6)
-        if th_auto is not None:
-            logger.info("[Auto-threshold] Precision≥0.6 → th=%.2f | coverage=%.3f", th_auto, cov_auto)
-        else:
-            logger.warning("[Auto-threshold] Не найден порог для precision≥0.6")
-    except Exception as e:
-        logger.warning("Auto-threshold search failed: %s", e)
-
-    # =========================
-    # 3) Калибровка на HOLDOUT (если есть) — на temperature-scaled вероятностях
-    # =========================
-    if calib is not None and proba_hold is not None and y_hold_np is not None:
-        y_pred_hold = proba_hold.argmax(axis=1).astype(int)
-        conf_hold   = proba_hold.max(axis=1)
-        is_correct  = (y_pred_hold == y_hold_np).astype(int)
-
-        ir = fit_confidence_calibrator(conf_hold, is_correct)
-
-        save_calibrator(ir, path=str(run_dir / "confidence_calibrator.pkl"))
-        save_calibrator(ir, path=str(MODEL_DIR / f"confidence_calibrator_{symbol}.pkl"))
-        save_calibrator(ir, path=str(MODEL_DIR / "confidence_calibrator.pkl"))
-        logger.info(
-            "Saved confidence calibrator → %s, and aliases: %s, %s",
-            str(run_dir / "confidence_calibrator.pkl"),
-            str(MODEL_DIR / f"confidence_calibrator_{symbol}.pkl"),
-            str(MODEL_DIR / "confidence_calibrator.pkl"),
-        )
-
-
-def _timestamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-
+    logger.warning("[Auto-threshold] No threshold reached target_precision=%.2f (best=%.3f @ th=%.2f, cov=%.3f)",
+                   target_precision, max(0.0, best_prec), best_th if best_th is not None else -1.0, best_cov)
+    return None, 0.0
 
 def _archive_artifacts(symbol: str, ts: str):
     """
     Копируем свежие артефакты тренера в персональную папку:
-    models/{symbol}/{ts}/(model.cbm, scaler.pkl, cat_features.pkl)
-    + плоские файлы model_{symbol}.cbm, scaler_{symbol}.pkl, cat_features_{symbol}.pkl
+    models/{symbol}/{ts}/(model.cbm, scaler.pkl, cat_features.pkl, feature_columns.pkl)
+    + плоские файлы model_{symbol}.cbm, scaler_{symbol}.pkl, cat_features_{symbol}.pkl, feature_columns_{symbol}.pkl
     """
-    # источники — где их сохраняет model_trainer
+    # источники — где их сохраняет model_trainer / prepare_data
     model_src = MODEL_DIR / "saved_model.cbm"
-    scaler_src = MODEL_DIR / "scaler.pkl"          # см. обновлённый save в prepare_data()
-    cat_src = MODEL_DIR / "cat_features.pkl"
+    scaler_src = MODEL_DIR / "scaler.pkl"              # см. сохранение в prepare_data()
+    cat_src    = MODEL_DIR / "cat_features.pkl"
+    feat_src   = MODEL_DIR / "feature_columns.pkl"     # критично для выравнивания фичей на инференсе
 
     target_dir = MODEL_DIR / symbol / ts
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -426,17 +323,255 @@ def _archive_artifacts(symbol: str, ts: str):
         except Exception as e:
             logger.warning(f"Не удалось скопировать {label}: {e}")
 
-    # в timestamp-папку
-    _safe_copy(model_src, target_dir / "model.cbm", "Модель")
-    _safe_copy(scaler_src, target_dir / "scaler.pkl", "Скейлер")
-    _safe_copy(cat_src,    target_dir / "cat_features.pkl", "cat_features")
+    # --- в timestamp-папку (run_dir) ---
+    _safe_copy(model_src, target_dir / "model.cbm",            "Модель")
+    _safe_copy(scaler_src, target_dir / "scaler.pkl",          "Скейлер")
+    _safe_copy(cat_src,    target_dir / "cat_features.pkl",    "cat_features")
+    _safe_copy(feat_src,   target_dir / "feature_columns.pkl", "feature_columns")
 
-    # плоские алиасы по символу (удобно искать)
-    _safe_copy(model_src, MODEL_DIR / f"model_{symbol}.cbm", "Модель (алиас)")
-    _safe_copy(scaler_src, MODEL_DIR / f"scaler_{symbol}.pkl", "Скейлер (алиас)")
-    _safe_copy(cat_src,    MODEL_DIR / f"cat_features_{symbol}.pkl", "cat_features (алиас)")
+    # --- плоские алиасы по символу ---
+    _safe_copy(model_src, MODEL_DIR / f"model_{symbol}.cbm",             "Модель (алиас)")
+    _safe_copy(scaler_src, MODEL_DIR / f"scaler_{symbol}.pkl",           "Скейлер (алиас)")
+    _safe_copy(cat_src,    MODEL_DIR / f"cat_features_{symbol}.pkl",     "cat_features (алиас)")
+    _safe_copy(feat_src,   MODEL_DIR / f"feature_columns_{symbol}.pkl",  "feature_columns (алиас)")
 
     return target_dir
+
+
+def evaluate_model(model, X_test, y_test, symbol="model", ts=None, calib=None):
+    """
+    Оценивает модель на TEST (eval) и, если передан calib=(X_hold, y_hold),
+    подбирает Temperature T по NLL на holdout (с safeguard по F1), применяет его,
+    обучает IsotonicRegression на conf(holdout) и сохраняет и T, и калибратор.
+
+    Все метрики/пороги считаются консистентно с прод-логикой:
+      proba -> Temperature -> max(proba) -> Isotonic.predict(conf).
+    """
+    from config import (
+        CONFIDENCE_THRESHOLDS,
+        TEMPERATURE_SCALING, TEMPERATURE_MIN, TEMPERATURE_MAX, TEMPERATURE_STEP,
+    )
+    from confidence_calibrator import fit_confidence_calibrator, save_calibrator
+
+    # --- гарантируем каталоги
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    symbol = symbol or "model"
+    tag = f"{symbol}" + (f"_{ts}" if ts else "")
+    run_dir = MODEL_DIR / symbol / (ts if ts else "")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- helpers
+    def _log_conf_stats(name: str, proba: np.ndarray):
+        conf = proba.max(axis=1)
+        logger.info("[%s] mean_conf=%.3f | p90=%.3f | p95=%.3f | max=%.3f",
+                    name,
+                    float(conf.mean()),
+                    float(np.quantile(conf, 0.90)),
+                    float(np.quantile(conf, 0.95)),
+                    float(conf.max()))
+
+    def _apply_isotonic(conf: np.ndarray, calibrator):
+        if calibrator is None:
+            return conf
+        try:
+            out = calibrator.predict(conf.reshape(-1))
+            out = np.asarray(out, dtype=float)
+            return np.clip(out, 0.0, 1.0)
+        except Exception as e:
+            logger.warning("Isotonic application failed: %s — using raw confidence", e)
+            return conf
+
+    def _atomic_write(path_obj, text_payload: str):
+        # Используем твой _atomic_write_text, если он есть; иначе — обычная запись
+        try:
+            _atomic_write_text(path_obj, text_payload)
+        except Exception:
+            try:
+                path_obj.write_text(text_payload)
+            except Exception as e:
+                logger.warning("Failed to write %s: %s", str(path_obj), e)
+
+    # =========================
+    # 1) HOLDOUT: подбор температуры и обучение калибратора
+    # =========================
+    best_T = 1.0
+    proba_hold_T = None
+    y_hold_np = None
+    calibrator = None
+
+    if calib is not None:
+        X_hold, y_hold = calib
+
+        # 1.1 Выравниваем HOLDOUT под обучающий пайплайн (строгий порядок/набор фич, cat idx)
+        X_hold_aligned, cat_idx_hold = _align_for_infer(X_hold, symbol=symbol)
+        pool_hold = cb.Pool(X_hold_aligned, cat_features=cat_idx_hold if cat_idx_hold else None)
+
+        # 1.2 Сырые вероятности на holdout
+        proba_hold_raw = np.asarray(model.predict_proba(pool_hold))
+        y_hold_np = np.asarray(y_hold).astype(int)
+
+        _log_conf_stats("HOLD raw", proba_hold_raw)
+
+        # 1.3 Подбор T по NLL (если включено и данных достаточно)
+        if TEMPERATURE_SCALING and len(y_hold_np) >= 30:
+            T_min = float(TEMPERATURE_MIN)
+            T_max = float(TEMPERATURE_MAX)
+            T_step = float(TEMPERATURE_STEP)
+            best_T = _find_best_temperature(proba_hold_raw, y_hold_np, T_min, T_max, T_step)
+            logger.info("Temperature scaling: candidate T=%.2f (chosen on holdout by NLL)", best_T)
+
+        # 1.4 Safeguard по macro-F1
+        y_pred_raw = proba_hold_raw.argmax(axis=1).astype(int)
+        f1_raw = f1_score(y_hold_np, y_pred_raw, average="macro")
+
+        proba_hold_T_cand = _apply_temperature_scaling(proba_hold_raw, best_T)
+        y_pred_T = proba_hold_T_cand.argmax(axis=1).astype(int)
+        f1_T = f1_score(y_hold_np, y_pred_T, average="macro")
+
+        if f1_T + 1e-9 < f1_raw - 0.01:
+            logger.info("Temperature rollback: F1 holdout decreased (raw=%.4f -> T=%.4f). Using T=1.0",
+                        f1_raw, f1_T)
+            best_T = 1.0
+            proba_hold_T = proba_hold_raw
+        else:
+            proba_hold_T = proba_hold_T_cand
+
+        _log_conf_stats("HOLD T", proba_hold_T)
+
+        # 1.5 Сохранить T (и алиасы) атомарно
+        payload = json.dumps({"T": float(best_T)})
+        _atomic_write(run_dir / "temperature.json", payload)
+        _atomic_write(MODEL_DIR / f"temperature_{symbol}.json", payload)
+        _atomic_write(MODEL_DIR / "temperature.json", payload)
+
+        # 1.6 Обучить калибратор уверенности на holdout (после Temperature)
+        conf_hold = proba_hold_T.max(axis=1)
+        is_correct = (proba_hold_T.argmax(axis=1).astype(int) == y_hold_np).astype(int)
+        ir = fit_confidence_calibrator(conf_hold, is_correct)
+        save_calibrator(ir, path=str(run_dir / "confidence_calibrator.pkl"))
+        save_calibrator(ir, path=str(MODEL_DIR / f"confidence_calibrator_{symbol}.pkl"))
+        save_calibrator(ir, path=str(MODEL_DIR / "confidence_calibrator.pkl"))
+        calibrator = ir
+    else:
+        logger.info("[Eval] No holdout calibration provided — using raw T=1.0 and no isotonic.")
+
+    # =========================
+    # 2) TEST/EVAL: метрики и отчёты (T и изотоник как в проде)
+    # =========================
+    # 2.1 Выравниваем TEST под обучающий пайплайн
+    X_test_aligned, cat_idx_test = _align_for_infer(X_test, symbol=symbol)
+    pool_test = cb.Pool(X_test_aligned, cat_features=cat_idx_test if cat_idx_test else None)
+
+    # 2.2 Вероятности + Temperature
+    proba_eval_raw = np.asarray(model.predict_proba(pool_test))
+    proba_eval_T = _apply_temperature_scaling(proba_eval_raw, best_T)
+    _log_conf_stats("EVAL T", proba_eval_T)
+
+    # 2.3 Предсказания и (калиброванная) уверенность
+    y_test_np = np.asarray(y_test).astype(int)
+    y_pred_eval = proba_eval_T.argmax(axis=1).astype(int)
+    conf_eval_raw = proba_eval_T.max(axis=1)
+    conf_eval_cal = _apply_isotonic(conf_eval_raw, calibrator)
+
+    logger.info("=" * 30 + f" [FINAL METRICS] {tag} " + "=" * 30)
+    acc_eval = accuracy_score(y_test_np, y_pred_eval)
+    f1m_eval = f1_score(y_test_np, y_pred_eval, average='macro')
+    logger.info("[All] Accuracy: %.4f", acc_eval)
+    logger.info("[All] F1 macro: %.4f", f1m_eval)
+
+    # per-class F1 (диагностика) — с гардом на «мало классов»
+    try:
+        uniq = np.unique(y_test_np)
+        if len(uniq) >= 2:
+            from sklearn.metrics import precision_recall_fscore_support
+            _, _, f1_per_cls, _ = precision_recall_fscore_support(
+                y_test_np, y_pred_eval, labels=[0, 1, 2], zero_division=0
+            )
+            logger.info("[Eval per-class] F1: Down=%.3f | Up=%.3f | Neutral=%.3f",
+                        f1_per_cls[0], f1_per_cls[1], f1_per_cls[2])
+        else:
+            logger.warning("[Eval] Less than 2 unique classes in y_test — skipping per-class metrics")
+    except Exception as e:
+        logger.warning("Per-class metrics failed: %s", e)
+
+    # 2.4 Отчёт и матрица ошибок
+    labels_order = [0, 1, 2]
+    target_names = ["Down", "Up", "Neutral"]
+    try:
+        report = classification_report(
+            y_test_np, y_pred_eval, labels=labels_order, target_names=target_names, zero_division=0
+        )
+        (OUTPUT_DIR / f"{tag}_report.txt").write_text(report)
+    except Exception as e:
+        logger.warning("Failed to write classification report: %s", e)
+
+    try:
+        ConfusionMatrixDisplay.from_predictions(y_test_np, y_pred_eval, cmap='viridis')
+        plt.title(f"Confusion Matrix ({tag})")
+        plt.savefig(OUTPUT_DIR / f"conf_matrix_{tag}.png")
+        plt.close()
+    except Exception as e:
+        logger.warning("Failed to save confusion matrix: %s", e)
+
+    # 2.5 Метрики по порогам — на КАЛИБРОВАННОЙ уверенности
+    for th in CONFIDENCE_THRESHOLDS:
+        mask = conf_eval_cal >= th
+        coverage = float(mask.mean())
+        if mask.any():
+            acc_c = accuracy_score(y_test_np[mask], y_pred_eval[mask])
+            f1m_c = f1_score(y_test_np[mask], y_pred_eval[mask], average='macro')
+            logger.info(f"[Conf(cal) >= {th:.2f}] Coverage: {coverage:.3f} | Acc: {acc_c:.4f} | F1 macro: {f1m_c:.4f}")
+        else:
+            logger.warning(f"[Conf(cal) >= {th:.2f}] Coverage: 0.000 — нет уверенных прогнозов")
+
+    # 2.6 Гистограммы уверенности (калиброванной)
+    try:
+        plt.figure(figsize=(8, 5))
+        for cls, name in zip([0, 1, 2], ["Down", "Up", "Neutral"]):
+            if np.any(y_test_np == cls):
+                plt.hist(conf_eval_cal[y_test_np == cls], bins=30, alpha=0.5, label=name)
+        plt.legend()
+        plt.title(f"Confidence distribution (eval, calibrated) — {symbol}")
+        out_hist = OUTPUT_DIR / f"conf_dist_{symbol}_{ts or 'run'}.png"
+        plt.tight_layout()
+        plt.savefig(out_hist)
+        plt.close()
+        logger.info("Saved confidence hist: %s", out_hist)
+    except Exception as e:
+        logger.warning("Failed to save confidence hist: %s", e)
+
+    # =========================
+    # 3) Поиск авто-порога по precision — на КАЛИБРОВАННОЙ уверенности
+    # =========================
+    try:
+        # пробуем «новую» сигнатуру (с calibrator/T); если нет — fallback на старую
+        try:
+            th_auto, cov_auto = find_threshold_for_precision(
+                y_true=y_test_np,
+                proba=proba_eval_T,           # уже после Temperature
+                target_precision=0.60,
+                calibrator=calibrator,        # чтобы рассчитывался calibrated confidence
+                T=best_T
+            )
+        except TypeError:
+            # старая версия без calibrator/T
+            th_auto, cov_auto = find_threshold_for_precision(y_test_np, proba_eval_T, target_precision=0.60)
+
+        if th_auto is not None:
+            logger.info("[Auto-threshold] Precision≥0.6 → th=%.2f | coverage=%.3f", th_auto, cov_auto)
+        else:
+            logger.warning("[Auto-threshold] Не найден порог для precision≥0.6")
+    except Exception as e:
+        logger.warning("Auto-threshold search failed: %s", e)
+
+
+
+def _timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
 def save_metadata(symbol: str, ts: str, best_params: dict, extras: dict = None):

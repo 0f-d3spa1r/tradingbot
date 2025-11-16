@@ -6,6 +6,7 @@ import logging
 import ta
 import talib
 from sklearn.cluster import KMeans
+from labels import generate_triple_barrier_target
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +127,9 @@ def generate_target(df: pd.DataFrame, threshold: float = 0.0015) -> pd.DataFrame
 def select_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     if "target" not in df.columns:
         logger.warning("`target` не найден, вызывается generate_target() с default threshold.")
-        df = generate_target(df)
+        df = generate_triple_barrier_target(df, tp_mul=1.2, sl_mul=0.8, max_horizon=30)
+
+
 
     df = generate_ta_features(df)
     df = generate_candle_patterns(df)

@@ -11,11 +11,9 @@ from ta.trend import EMAIndicator
 from pybit.unified_trading import HTTP
 
 from data_loader import fetch_ohlcv
-from model_trainer import load_model_and_scaler, predict_on_batch
+from runtime_infer import infer_batch
 from data_loader import set_client as set_data_client
 
-# ✅ Калибровка уверенности (из Experiment Pack v1)
-from confidence_calibrator import load_calibrator, apply_calibration
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +130,8 @@ def compute_pair_score(
 # ============================================================
 # 🧠 Оценка нескольких пар (основная логика)
 # ============================================================
+
+
 def evaluate_pairs(
     symbols: List[str],
     interval: str,
@@ -142,94 +142,49 @@ def evaluate_pairs(
     debug: bool = False,
     window: int = 150,
     save_results: bool = False,
-    model=None,
-    scaler=None
 ) -> Union[List[str], List[Tuple[str, float]]]:
     """
     Оценивает пары и возвращает топ-N по скору.
+    Использует продовый инференс через runtime_infer.infer_batch.
     """
-    # === Загружаем модель и скейлер ===
-    if model is None or scaler is None:
-        model, scaler, cat_features = load_model_and_scaler()
-    else:
-        cat_features = None  # внешние артефакты переданы — cat_features определим по входу
-
-    # ✅ Калибратор — грузим один раз
-    calibrator = load_calibrator("models/confidence_calibrator.pkl")
+    from feature_engineering import select_features
 
     pair_scores: List[Tuple[str, float]] = []
-    from feature_engineering import select_features
 
     for symbol in symbols:
         try:
-            # 1) Данные: сырые свечи
-            df = fetch_ohlcv(symbol, interval, limit=max(window, 60)).tail(window)
+            # 1) Загрузка данных
+            df = fetch_ohlcv(symbol, interval, limit=max(window, 60))
+            if df is None or df.empty:
+                if debug:
+                    logger.warning(f"[{symbol}] fetch_ohlcv вернул пустой DataFrame — пропускаю.")
+                continue
+            df = df.tail(window)
 
-            # 2) Генерация признаков
+            # 2) Feature generation
             X, _ = select_features(df)
             if X.empty:
                 if debug:
                     logger.warning(f"[{symbol}] Пустой набор признаков — пропускаю.")
                 continue
+            X = X.replace([np.inf, -np.inf], np.nan).fillna(0)
 
-            X_cat = X.select_dtypes(include=["object", "category"])
-            X_num = X.select_dtypes(include=["number"])
-            if X_num.empty:
-                if debug:
-                    logger.warning(f"[{symbol}] Нет числовых признаков — пропускаю.")
-                continue
-
-            # 3) Выравнивание под scaler.feature_names_in_
-            if hasattr(scaler, "feature_names_in_"):
-                for col in scaler.feature_names_in_:
-                    if col not in X_num.columns:
-                        X_num[col] = 0.0
-                keep_order = [c for c in scaler.feature_names_in_ if c in X_num.columns]
-                X_num = X_num.loc[:, keep_order]
-
-            # 4) Скейлинг
+            # 3) Инференс
             try:
-                X_scaled = pd.DataFrame(
-                    scaler.transform(X_num),
-                    columns=X_num.columns,
-                    index=X_num.index
-                )
-            except Exception as te:
-                logger.warning(f"[{symbol}] Ошибка scaler.transform: {te} — пропускаю.")
+                infer_res = infer_batch(X, symbol=symbol, ts=None)
+            except Exception:
+                logger.exception(f"[{symbol}] infer_batch failed — пропускаю пару.")
                 continue
 
-            # 5) Финальный вход
-            X_input = pd.concat(
-                [X_scaled.reset_index(drop=True), X_cat.reset_index(drop=True)],
-                axis=1
-            )
+            y_pred = np.asarray(infer_res["y_pred"]).astype(int).ravel()
+            conf_arr = np.asarray(infer_res["conf"]).astype(float).ravel()
 
-            # ✅ Катфичи — определяем ДЛЯ КАЖДОГО СИМВОЛА по фактическому входу
-            current_cat_features = (
-                X_input.select_dtypes(include=["object", "category"]).columns.tolist()
-                if cat_features is None else cat_features
-            )
+            # 4) Последние 50 точек
+            confidences = conf_arr[-50:].tolist()
+            predictions = y_pred[-50:].tolist()
+            model_data = {"confidences": confidences, "predictions": predictions}
 
-            # 6) Предсказания
-            preds, confidences = predict_on_batch(
-                model, X_input, cat_features=current_cat_features
-            )
-
-            # ✅ Гарантируем 1D-вектор confidences и применяем калибровку
-            conf_arr = np.asarray(confidences)
-            if conf_arr.ndim == 2:
-                conf_arr = conf_arr.max(axis=1)
-            elif conf_arr.ndim == 0:
-                conf_arr = np.array([float(conf_arr)])
-            conf_arr = apply_calibration(calibrator, conf_arr)
-            confidences = conf_arr.tolist()
-
-            model_data = {
-                "confidences": confidences[-50:],
-                "predictions": np.asarray(preds).astype(int).ravel().tolist()[-50:],
-            }
-
-            # 7) Скоринг
+            # 5) Расчёт score
             score = compute_pair_score(
                 df=df,
                 model_data=model_data,
@@ -238,7 +193,8 @@ def evaluate_pairs(
             )
 
             if debug:
-                logger.info(f"[✓] {symbol} — Score: {score:.4f}")
+                level = infer_res.get("artifacts_level", "?")
+                logger.info(f"[✓] {symbol} — Score: {score:.4f} | artifacts={level}")
 
             pair_scores.append((symbol, float(score)))
 
@@ -249,7 +205,11 @@ def evaluate_pairs(
         except Exception:
             logger.exception(f"[{symbol}] Неизвестная ошибка")
 
-    # 8) Сортировка и сохранение
+    if not pair_scores:
+        logger.warning("[evaluate_pairs] Нет валидных пар — возвращаю пустой список.")
+        return []
+
+    # 6) Сортировка и сохранение
     sorted_pairs = sorted(pair_scores, key=lambda x: x[1], reverse=True)
     top_pairs = sorted_pairs[:top_n]
 
@@ -266,11 +226,9 @@ def evaluate_pairs(
         except Exception as e:
             logger.warning(f"[!] Не удалось сохранить файл: {e}")
 
-    return top_pairs if return_scores else [s for s, _ in top_pairs]
+    result = top_pairs if return_scores else [s for s, _ in top_pairs]
+    return result
 
-# ============================================================
-# 🎯 Обёртка: просто топ-N тикеров
-# ============================================================
 def rank_pairs(symbols: List[str], interval: str = "15", top_n: int = 5) -> List[str]:
     return evaluate_pairs(
         symbols=symbols,

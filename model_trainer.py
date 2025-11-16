@@ -2,7 +2,7 @@ import os
 import pickle
 import logging
 from typing import Tuple, List
-
+import  pathlib, tempfile, shutil
 import numpy as np
 import pandas as pd
 
@@ -26,6 +26,12 @@ import json
 # ================= Project-specific imports =================
 from config import (
     USE_RESAMPLING,
+    FEATURE_BAGGING_FRAC,
+    TEMPERATURE_SCALING,
+    TEMPERATURE_MIN,
+    TEMPERATURE_MAX,
+    TEMPERATURE_STEP,
+    EMBARGO_BARS,
     RESAMPLING_STRATEGY,
     USE_CLASS_WEIGHTS,
     CLASS_WEIGHT_MODE,
@@ -34,6 +40,7 @@ from config import (
 from data_loader import get_processed_ohlcv
 from feature_engineering import generate_target, select_features, generate_clustering
 
+from pathlib import Path
 # ================= Optional: imblearn fallbacks =================
 try:
     from imblearn.over_sampling import SMOTE
@@ -48,6 +55,24 @@ logger = logging.getLogger(__name__)
 UP_THRESHOLD = 0.002
 DOWN_THRESHOLD = 0.0015
 
+MODEL_DIR = Path("models")
+OUTPUT_DIR = Path("outputs")
+
+# ---------- atomic write helpers ----------
+def _atomic_write_text(path: pathlib.Path, text: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=str(path.parent), encoding="utf-8") as tmp:
+        tmp.write(text)
+        tmp_path = tmp.name
+    os.replace(tmp_path, str(path))
+
+def _atomic_copy(src: pathlib.Path, dst: pathlib.Path):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("wb", delete=False, dir=str(dst.parent)) as tmp:
+        shutil.copyfile(src, tmp.name)
+        tmp_path = tmp.name
+    os.replace(tmp_path, str(dst))
+
 
 def _sanitize_categoricals(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     """
@@ -59,6 +84,22 @@ def _sanitize_categoricals(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     for c in cat_cols:
         out[c] = out[c].astype("string").fillna("__NA__")
     return out, cat_cols
+
+# ---------- isotonic application ----------
+def apply_isotonic_confidence(ir, conf: np.ndarray) -> np.ndarray:
+    # sklearn IsotonicRegression: используем predict
+    conf_cal = ir.predict(conf.astype(np.float64))
+    conf_cal = np.clip(conf_cal, 0.0, 1.0).astype(np.float64)
+    return conf_cal
+
+# ---------- class weights with smoothing ----------
+def _compute_class_weights(y: np.ndarray, alpha: float = 2.0, cap: float = 8.0) -> dict[int, float]:
+    # w_c = 1 / (count + alpha), нормируем и ограничиваем cap
+    classes, counts = np.unique(y, return_counts=True)
+    inv = {int(c): 1.0 / (cnt + alpha) for c, cnt in zip(classes, counts)}
+    mean_inv = np.mean(list(inv.values()))
+    w = {c: min(inv[c] / mean_inv, cap) for c in inv}
+    return w
 
 
 def prepare_data(symbol: str, interval: str, threshold: float) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
@@ -311,12 +352,12 @@ def optimize_catboost(X_train: pd.DataFrame, y_train: pd.Series) -> dict:
     optimizer = BayesianOptimization(
         f=evaluate,
         pbounds={
-            "depth": (5, 7),  # чуть глубже
-            "learning_rate": (0.05, 0.12),  # средняя зона
-            "l2_leaf_reg": (4.0, 15.0),  # помягче
-            "bagging_temperature": (0.1, 0.8),
-            "random_strength": (0.5, 6.0),  # снизили верх
-            "rsm": (0.70, 0.95),  # не так низко
+            "depth": (4, 6),  # чуть глубже
+            "learning_rate": (0.03, 0.12),  # средняя зона
+            "l2_leaf_reg": (3.0, 20.0),  # помягче
+            "bagging_temperature": (0.0, 1.0),
+            "random_strength": (0.5, 20.0),  # снизили верх
+            "rsm": (0.5, 0.95),  # не так низко
         },
         random_state=42,
         verbose=0,
@@ -451,183 +492,226 @@ def rolling_cross_validation(
     return scores
 
 
-def train_final_model(X_train: pd.DataFrame, y_train: pd.Series, best_params: dict):
+def train_final_model(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    best_params: dict,
+) -> "cb.CatBoostClassifier":
     """
-    Финальный фит CatBoost:
-    - санитизация категориальных (str + fillna('__NA__'))
-    - class weights (если включено в config)
-    - early stopping на train (eval_set=train) — осознанно
-    - сохранение модели, cat_features и диагностических отчётов
+    Финальный фит CatBoost с прод-гардами:
+      - строгая выравниловка длин X/y и dtype целевого
+      - санитизация категориальных (str + fillna('__NA__'))
+      - (опц.) лёгкий feature bagging (по config.FEATURE_BAGGING_FRAC)
+      - сохранение feature_columns.pkl и cat_features.pkl (алиасы в models/)
+      - class reweight (по config.USE_CLASS_WEIGHTS / CLASS_WEIGHT_MODE) + безопасная нарезка на train-чанк
+      - early stopping на "хвосте" трейна (последние 10%), guard при слишком малом вал-чане
+      - итоговые диагностические метрики + отчёты (train)
+      - сохранение модели в models/saved_model.cbm (алиас для пайплайна/архиватора)
+
+    Возвращает обученную модель.
     """
+    import os, pickle
+    import numpy as np
+    from sklearn.metrics import (
+        accuracy_score, f1_score, precision_score, recall_score, classification_report,
+        ConfusionMatrixDisplay,
+    )
     from sklearn.utils.class_weight import compute_sample_weight
 
     os.makedirs("models", exist_ok=True)
     os.makedirs("outputs", exist_ok=True)
 
-    # --- ГАРД: выравниваем длины X/y (если кто-то тронул y по дороге) ---
+    # --- 0) ГАРД: выравниваем длины X/y + тип y
     if len(X_train) != len(y_train):
         n_safe = min(len(X_train), len(y_train))
         logger.warning("[FinalFit] Length mismatch: X=%d, y=%d → aligning to %d",
                        len(X_train), len(y_train), n_safe)
         X_train = X_train.iloc[:n_safe].reset_index(drop=True)
         y_train = y_train.iloc[:n_safe].reset_index(drop=True)
-
-    # --- тип y: строго int ---
     y_train = y_train.astype(int).reset_index(drop=True)
 
-    # --- санитизация категориальных + список cat_features ---
-    X_train_s, cat_features = _sanitize_categoricals(X_train)
-    # CatBoost нормально принимает None вместо пустого списка
+    # --- 1) Санитизация категориальных + список cat_features (по именам)
+    X_train_s, cat_features = _sanitize_categoricals(X_train)  # твоя функция уже есть
     cat_features_arg = cat_features or None
 
-    # --- (опционально) лёгкий feature bagging: случайно «урезать» фичи на 5% ---
+    # --- 2) (опц.) Feature bagging — сузить набор фич и сохранить его для инференса
+    FEATURE_BAGGING_FRAC = None
     try:
-        from config import FEATURE_BAGGING_FRAC
+        from config import FEATURE_BAGGING_FRAC as _FBF
+        FEATURE_BAGGING_FRAC = _FBF
     except Exception:
-        FEATURE_BAGGING_FRAC = None
+        pass
 
-    if FEATURE_BAGGING_FRAC and 0.0 < FEATURE_BAGGING_FRAC < 1.0:
+    if FEATURE_BAGGING_FRAC and 0.0 < float(FEATURE_BAGGING_FRAC) < 1.0:
         feat_cols = X_train_s.columns.tolist()
-        # не имеет смысла на очень маленьком числе признаков
         if len(feat_cols) >= 20:
+            rng = np.random.default_rng(42)
             keep_n = max(1, int(len(feat_cols) * float(FEATURE_BAGGING_FRAC)))
-            rng = np.random.default_rng(42)  # фиксируем отбор колонок
             keep_cols = sorted(rng.choice(feat_cols, size=keep_n, replace=False).tolist())
-
-            # сужаем обучающую матрицу и список категориальных
             X_train_s = X_train_s[keep_cols]
             if cat_features:
                 cat_features = [c for c in cat_features if c in keep_cols]
             cat_features_arg = (cat_features or None)
-
             logger.info("[FeatureBagging] kept %d/%d features", keep_n, len(feat_cols))
-
-            # 🔒 Сохраняем список колонок, чтобы инференс использовал точно тот же порядок/набор
-            os.makedirs("models", exist_ok=True)
-            with open("models/feature_columns.pkl", "wb") as f:
-                pickle.dump(keep_cols, f)
         else:
             logger.info("[FeatureBagging] skipped (features=%d < 20)", len(feat_cols))
 
-    # Сохраняем фактический порядок/набор фич (для строгого выравнивания при инференсе)
+    # --- 2.1) Сохраняем фактический набор/порядок фич + cat_features (алиасы в корень models/)
     feature_columns = X_train_s.columns.tolist()
     try:
         with open(os.path.join("models", "feature_columns.pkl"), "wb") as f:
             pickle.dump(feature_columns, f)
-        # (опционально) по-символьно:
-        # with open(os.path.join("models", f"feature_columns_{symbol}.pkl"), "wb") as f:
-        #     pickle.dump(feature_columns, f)
-        logger.info("[Artifacts] Saved feature_columns.pkl (%d cols)", len(feature_columns))
+        with open(os.path.join("models", "cat_features.pkl"), "wb") as f:
+            pickle.dump(cat_features or [], f)
+        logger.info("[Artifacts] Saved feature_columns.pkl (%d) & cat_features.pkl (%d)",
+                    len(feature_columns), len(cat_features or []))
     except Exception as e:
-        logger.warning("Failed to save feature_columns.pkl: %s", e)
+        logger.warning("[Artifacts] Failed to save feature_columns/cat_features: %s", e)
 
-    # --- параметры модели ---
+    # --- 3) Параметры модели (согласованы по смыслу с BO)
     params = best_params.copy()
     params["depth"] = int(params.get("depth", 6))
-    params.update({
-        "loss_function": "MultiClass",
-        "random_seed": 42,
-        "iterations": 500,
-        "verbose": False,
-    })
+    params.setdefault("loss_function", "MultiClass")
+    params.setdefault("random_seed", 42)
+    params.setdefault("iterations", 600)             # чуть больше, т.к. есть early stop
+    params.setdefault("bootstrap_type", "Bayesian")  # стабильный бутстрап
+    params.setdefault("rsm", 0.8)
+    params.setdefault("random_strength", 2.0)
+    params.setdefault("verbose", False)
 
-    # --- class weights (если включено в config) ---
-    sample_weight = None
+    # --- 4) Class weights (по конфигу) — balanced или выключено
+    sample_weight_full = None
     try:
         from config import USE_CLASS_WEIGHTS, CLASS_WEIGHT_MODE
         if USE_CLASS_WEIGHTS and CLASS_WEIGHT_MODE == "balanced":
-            sample_weight = compute_sample_weight(class_weight="balanced", y=y_train)
+            sample_weight_full = compute_sample_weight(class_weight="balanced", y=y_train)
             logger.info("[ClassWeight] Enabled — balanced per-sample weights applied")
     except Exception:
         pass
 
-    # --- обучение с ранним стопом по train (как договорились) ---
-    # --- внутренний валид: последние 10% трейна ---
-    # --- внутренний валид: последние 10% трейна ---
+    # --- 5) Early stopping на последнем куске трейна (10%), guard при малом вал-чанке
     n = len(X_train_s)
     cut = max(1, int(n * 0.9))
     X_tr, y_tr = X_train_s.iloc[:cut], y_train.iloc[:cut]
     X_val, y_val = X_train_s.iloc[cut:], y_train.iloc[cut:]
 
-    # --- корректно нарезаем веса под train-часть ---
-    sw_tr = None
-    if 'sample_weight' in locals() and sample_weight is not None:
-        # приводим к numpy и нарезаем по cut, если длины совпадают
-        sw_arr = np.asarray(sample_weight)
-        if len(sw_arr) == len(y_train):
-            sw_tr = sw_arr[:cut]
-        else:
-            # на всякий: если вдруг уже совпадает с train-частью
-            sw_tr = sw_arr
+    use_es = True
+    if len(X_val) < 20:
+        use_es = False
+        logger.warning("[FinalFit] Val chunk too small (n=%d) → disabling early stopping", len(X_val))
 
+    # --- корректно нарезаем веса под train/val (если были)
+    sw_tr = sw_val = None
+    if sample_weight_full is not None and len(sample_weight_full) == len(y_train):
+        sw_tr = np.asarray(sample_weight_full[:cut])
+        sw_val = np.asarray(sample_weight_full[cut:]) if use_es else None
+
+    # --- 6) Обучение
     model = cb.CatBoostClassifier(**params)
-    model.fit(
-        X_tr, y_tr,
-        sample_weight=sw_tr,
-        cat_features=cat_features_arg,
-        eval_set=(X_val, y_val),
-        early_stopping_rounds=40,
+
+    fit_kwargs = dict(
+        X=X_tr,
+        y=y_tr,
+        sample_weight=sw_tr,  # можно оставить, это ок
+        cat_features=([X_tr.columns.get_loc(c) for c in (cat_features or [])] or None),
         verbose=False,
     )
 
-    # --- сохранение артефактов ---
-    model.save_model("models/saved_model.cbm")
-    with open("models/cat_features.pkl", "wb") as f:
-        pickle.dump(cat_features, f)  # сохраняем фактический список (может быть пустым)
+    if use_es:
+        fit_kwargs.update(
+            eval_set=(X_val, y_val),
+            early_stopping_rounds=40,
+        )
 
-    # --- диагностика на train ---
-    y_pred = np.asarray(model.predict(X_train_s)).ravel().astype(int)
-    proba  = np.asarray(model.predict_proba(X_train_s))
-    conf   = proba.max(axis=1)
+    model.fit(**fit_kwargs)
 
-    f1  = f1_score(y_train, y_pred, average="macro")
-    acc = accuracy_score(y_train, y_pred)
-    prec = precision_score(y_train, y_pred, average=None, labels=[0, 1, 2], zero_division=0)
-    rec  = recall_score(y_train, y_pred, average=None, labels=[0, 1, 2], zero_division=0)
+    # --- 7) Сохранение модели (алиас, дальше пайплайн архивирует в run_dir)
+    try:
+        model.save_model("models/saved_model.cbm")
+        logger.info("Model saved → models/saved_model.cbm")
+    except Exception as e:
+        logger.warning("Failed to save model alias: %s", e)
 
-    logger.info("Final model — Accuracy: %.4f, F1_macro: %.4f", acc, f1)
-    for i in range(3):
-        logger.info("Class %d — Precision: %.3f, Recall: %.3f", i, prec[i], rec[i])
+    # --- 8) Диагностика: train-чанк vs val-чанк (gap)
+    try:
+        from sklearn.metrics import f1_score
+        y_pred_tr = model.predict(X_tr)
+        y_pred_tr = np.asarray(y_pred_tr).ravel().astype(int)
+        f1_tr = f1_score(y_tr, y_pred_tr, average="macro")
+        if use_es:
+            y_pred_val = model.predict(X_val)
+            y_pred_val = np.asarray(y_pred_val).ravel().astype(int)
+            f1_val = f1_score(y_val, y_pred_val, average="macro")
+            logger.info("[FinalFit diag] F1(train-chunk)=%.4f | F1(val-chunk)=%.4f | gap=%.4f",
+                        f1_tr, f1_val, f1_tr - f1_val)
+        else:
+            logger.info("[FinalFit diag] F1(train-chunk)=%.4f | (no val-chunk)", f1_tr)
+    except Exception:
+        pass
 
-    # Confusion matrix (train)
-    ConfusionMatrixDisplay.from_predictions(y_train, y_pred, cmap="viridis")
-    plt.title("Confusion Matrix (train)")
-    plt.savefig("outputs/confusion_matrix.png")
-    plt.close()
+    # --- 9) Отчёты по train (для контроля деградации)
+    try:
+        proba_tr = np.asarray(model.predict_proba(X_train_s))
+        y_pred_tr = np.asarray(model.predict(X_train_s)).ravel().astype(int)
+        conf_tr = proba_tr.max(axis=1)
 
-    # Feature importance (устойчиво к версиям CatBoost)
-    importances = model.get_feature_importance(prettified=True)
-    feat_col = "Feature Id" if "Feature Id" in importances.columns else (
-        "Feature" if "Feature" in importances.columns else importances.columns[0]
-    )
-    val_col = "Importances" if "Importances" in importances.columns else importances.columns[-1]
-    plt.figure(figsize=(10, 6))
-    plt.barh(importances[feat_col], importances[val_col])
-    plt.tight_layout()
-    plt.savefig("outputs/catboost_feature_importance.png")
-    plt.close()
+        f1 = f1_score(y_train, y_pred_tr, average="macro")
+        acc = accuracy_score(y_train, y_pred_tr)
+        prec = precision_score(y_train, y_pred_tr, average=None, labels=[0, 1, 2], zero_division=0)
+        rec  = recall_score(y_train, y_pred_tr, average=None, labels=[0, 1, 2], zero_division=0)
+        logger.info("Final model — Accuracy: %.4f, F1_macro: %.4f", acc, f1)
+        for i in range(3):
+            logger.info("Class %d — Precision: %.3f, Recall: %.3f", i, prec[i], rec[i])
 
-    # Текстовый отчёт
-    with open("outputs/classification_report.txt", "w") as f:
-        f.write(classification_report(y_train, y_pred, target_names=["Down", "Up", "Neutral"], zero_division=0))
-
-    # Метрики на “уверенных” подмножествах
-    for th in CONFIDENCE_THRESHOLDS:
-        idx = conf >= th
-        cov = float(np.mean(idx)) if len(idx) else 0.0
-        if np.sum(idx) == 0:
-            logger.warning("[Conf >= %.2f] Coverage: %.3f — нет уверенных предсказаний", th, cov)
-            continue
-        y_true_c = np.asarray(y_train)[idx]
-        y_pred_c = y_pred[idx]
-        acc_c = accuracy_score(y_true_c, y_pred_c)
-        f1_c  = f1_score(y_true_c, y_pred_c, average="macro", zero_division=0)
-        logger.info("[Conf >= %.2f] Coverage: %.3f | Acc: %.4f | F1_macro: %.4f", th, cov, acc_c, f1_c)
-
-        ConfusionMatrixDisplay.from_predictions(y_true_c, y_pred_c, cmap="viridis")
-        plt.title(f"Confusion Matrix @ Confidence ≥ {th:.2f} (train)")
-        plt.savefig(f"outputs/conf_matrix_conf_{int(th*100)}.png")
+        ConfusionMatrixDisplay.from_predictions(y_train, y_pred_tr, cmap="viridis")
+        plt.title("Confusion Matrix (train)")
+        plt.savefig("outputs/confusion_matrix.png")
         plt.close()
+
+        importances = model.get_feature_importance(prettified=True)
+        feat_col = "Feature Id" if "Feature Id" in importances.columns else (
+            "Feature" if "Feature" in importances.columns else importances.columns[0]
+        )
+        val_col = "Importances" if "Importances" in importances.columns else importances.columns[-1]
+        plt.figure(figsize=(10, 6))
+        plt.barh(importances[feat_col], importances[val_col])
+        plt.tight_layout()
+        plt.savefig("outputs/catboost_feature_importance.png")
+        plt.close()
+
+        with open("outputs/classification_report.txt", "w", encoding="utf-8") as f:
+            f.write(classification_report(
+                y_train, y_pred_tr,
+                target_names=["Down", "Up", "Neutral"], zero_division=0
+            ))
+
+        try:
+            from config import CONFIDENCE_THRESHOLDS
+        except Exception:
+            CONFIDENCE_THRESHOLDS = [0.5, 0.6, 0.7]
+
+        for th in CONFIDENCE_THRESHOLDS:
+            idx = conf_tr >= th
+            cov = float(np.mean(idx)) if len(idx) else 0.0
+            if np.sum(idx) == 0:
+                logger.warning("[Conf >= %.2f] Coverage: %.3f — нет уверенных предсказаний", th, cov)
+                continue
+            y_true_c = np.asarray(y_train)[idx]
+            y_pred_c = y_pred_tr[idx]
+            acc_c = accuracy_score(y_true_c, y_pred_c)
+            f1_c  = f1_score(y_true_c, y_pred_c, average="macro", zero_division=0)
+            logger.info("[Conf >= %.2f] Coverage: %.3f | Acc: %.4f | F1_macro: %.4f", th, cov, acc_c, f1_c)
+
+            ConfusionMatrixDisplay.from_predictions(y_true_c, y_pred_c, cmap="viridis")
+            plt.title(f"Confusion Matrix @ Confidence ≥ {th:.2f} (train)")
+            plt.savefig(f"outputs/conf_matrix_conf_{int(th*100)}.png")
+            plt.close()
+
+    except Exception as e:
+        logger.warning("[FinalFit reports] skipped due to: %s", e)
+
+    return model
+
 
 
 def load_model_and_scaler(
