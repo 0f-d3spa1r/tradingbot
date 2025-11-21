@@ -154,4 +154,13 @@ TEMPERATURE_MAX: float = 3.0               # максимум T
 TEMPERATURE_STEP: float = 0.1              # шаг перебора T
 
 # --- (опционально) лёгкий feature bagging на финальном фите ---
-FEATURE_BAGGING_FRAC: float | None = 0.95  # None to disable; 0.95 keeps 95% random features
+FEATURE_BAGGING_FRAC: float | None = None
+
+
+# --- Triple-barrier target ---
+# --- Triple-barrier target (BASELINE) ---
+TB_TP_MUL: float = 1.0
+TB_SL_MUL: float = 1.0
+TB_MAX_HORIZON: int = 24
+TB_ATR_WINDOW: int = 14
+

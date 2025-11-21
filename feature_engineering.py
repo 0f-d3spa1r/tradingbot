@@ -7,6 +7,8 @@ import ta
 import talib
 from sklearn.cluster import KMeans
 from labels import generate_triple_barrier_target
+from config import TB_TP_MUL, TB_SL_MUL, TB_MAX_HORIZON, TB_ATR_WINDOW
+
 
 logger = logging.getLogger(__name__)
 
@@ -116,19 +118,35 @@ def generate_clustering(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def generate_target(df: pd.DataFrame, threshold: float = 0.0015) -> pd.DataFrame:
-    df["future_return"] = df["close"].shift(-1) / df["close"] - 1
-    df["target"] = df["future_return"].apply(
-        lambda x: 1 if x > threshold else (0 if x < -threshold else 2)
+def generate_target(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Генерирует таргет через triple-barrier с параметрами из config.
+    Используется как стандартный способ навесить колонку `target`.
+    """
+    df = generate_triple_barrier_target(
+        df,
+        tp_mul=TB_TP_MUL,
+        sl_mul=TB_SL_MUL,
+        max_horizon=TB_MAX_HORIZON,
+        atr_window=TB_ATR_WINDOW,
+        inplace=False,  # возвращаем копию, select_features всё равно получает df
     )
     return df
 
 
 def select_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     if "target" not in df.columns:
-        logger.warning("`target` не найден, вызывается generate_target() с default threshold.")
-        df = generate_triple_barrier_target(df, tp_mul=1.2, sl_mul=0.8, max_horizon=30)
-
+        logger.warning(
+            "`target` не найден, генерирую triple-barrier target с параметрами из config."
+        )
+        df = generate_triple_barrier_target(
+            df,
+            tp_mul=TB_TP_MUL,
+            sl_mul=TB_SL_MUL,
+            max_horizon=TB_MAX_HORIZON,
+            atr_window=TB_ATR_WINDOW,
+            inplace=False,
+        )
 
 
     df = generate_ta_features(df)

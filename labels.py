@@ -125,7 +125,6 @@ def generate_triple_barrier_target(
     return base
 
 
-
 def triple_barrier_from_candles(
     df: pd.DataFrame,
     tp_mul: float = 1.5,

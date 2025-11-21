@@ -433,8 +433,10 @@ def evaluate_model(model, X_test, y_test, symbol="model", ts=None, calib=None):
         f1_T = f1_score(y_hold_np, y_pred_T, average="macro")
 
         if f1_T + 1e-9 < f1_raw - 0.01:
-            logger.info("Temperature rollback: F1 holdout decreased (raw=%.4f -> T=%.4f). Using T=1.0",
-                        f1_raw, f1_T)
+            logger.info(
+                "Temperature rollback: F1 holdout decreased (raw=%.4f -> T=%.4f). Using T=1.0",
+                f1_raw, f1_T
+            )
             best_T = 1.0
             proba_hold_T = proba_hold_raw
         else:
@@ -479,38 +481,53 @@ def evaluate_model(model, X_test, y_test, symbol="model", ts=None, calib=None):
 
     logger.info("=" * 30 + f" [FINAL METRICS] {tag} " + "=" * 30)
     acc_eval = accuracy_score(y_test_np, y_pred_eval)
-    f1m_eval = f1_score(y_test_np, y_pred_eval, average='macro')
+    f1m_eval = f1_score(y_test_np, y_pred_eval, average="macro")
     logger.info("[All] Accuracy: %.4f", acc_eval)
     logger.info("[All] F1 macro: %.4f", f1m_eval)
 
-    # per-class F1 (диагностика) — с гардом на «мало классов»
+    # ------- динамические классы (2 или 3) -------
+    uniq = np.unique(y_test_np)
+    # сортируем, чтобы 0,1,(2) шли в правильном порядке
+    labels_order = sorted(int(c) for c in uniq)
+    name_map = {0: "Down", 1: "Up", 2: "Neutral"}
+    target_names = [name_map.get(c, str(c)) for c in labels_order]
+
+    # per-class F1 (диагностика)
     try:
-        uniq = np.unique(y_test_np)
-        if len(uniq) >= 2:
+        if len(labels_order) >= 2:
             from sklearn.metrics import precision_recall_fscore_support
             _, _, f1_per_cls, _ = precision_recall_fscore_support(
-                y_test_np, y_pred_eval, labels=[0, 1, 2], zero_division=0
+                y_test_np,
+                y_pred_eval,
+                labels=labels_order,
+                zero_division=0,
             )
-            logger.info("[Eval per-class] F1: Down=%.3f | Up=%.3f | Neutral=%.3f",
-                        f1_per_cls[0], f1_per_cls[1], f1_per_cls[2])
+            log_parts = []
+            for c, f1_c in zip(labels_order, f1_per_cls):
+                log_parts.append(f"{name_map.get(c, c)}={f1_c:.3f}")
+            logger.info("[Eval per-class] F1: " + " | ".join(log_parts))
         else:
             logger.warning("[Eval] Less than 2 unique classes in y_test — skipping per-class metrics")
     except Exception as e:
         logger.warning("Per-class metrics failed: %s", e)
 
     # 2.4 Отчёт и матрица ошибок
-    labels_order = [0, 1, 2]
-    target_names = ["Down", "Up", "Neutral"]
     try:
         report = classification_report(
-            y_test_np, y_pred_eval, labels=labels_order, target_names=target_names, zero_division=0
+            y_test_np,
+            y_pred_eval,
+            labels=labels_order,
+            target_names=target_names,
+            zero_division=0,
         )
         (OUTPUT_DIR / f"{tag}_report.txt").write_text(report)
     except Exception as e:
         logger.warning("Failed to write classification report: %s", e)
 
     try:
-        ConfusionMatrixDisplay.from_predictions(y_test_np, y_pred_eval, cmap='viridis')
+        ConfusionMatrixDisplay.from_predictions(
+            y_test_np, y_pred_eval, labels=labels_order, cmap="viridis"
+        )
         plt.title(f"Confusion Matrix ({tag})")
         plt.savefig(OUTPUT_DIR / f"conf_matrix_{tag}.png")
         plt.close()
@@ -523,17 +540,26 @@ def evaluate_model(model, X_test, y_test, symbol="model", ts=None, calib=None):
         coverage = float(mask.mean())
         if mask.any():
             acc_c = accuracy_score(y_test_np[mask], y_pred_eval[mask])
-            f1m_c = f1_score(y_test_np[mask], y_pred_eval[mask], average='macro')
-            logger.info(f"[Conf(cal) >= {th:.2f}] Coverage: {coverage:.3f} | Acc: {acc_c:.4f} | F1 macro: {f1m_c:.4f}")
+            f1m_c = f1_score(y_test_np[mask], y_pred_eval[mask], average="macro")
+            logger.info(
+                f"[Conf(cal) >= {th:.2f}] Coverage: {coverage:.3f} | "
+                f"Acc: {acc_c:.4f} | F1 macro: {f1m_c:.4f}"
+            )
         else:
             logger.warning(f"[Conf(cal) >= {th:.2f}] Coverage: 0.000 — нет уверенных прогнозов")
 
     # 2.6 Гистограммы уверенности (калиброванной)
     try:
         plt.figure(figsize=(8, 5))
-        for cls, name in zip([0, 1, 2], ["Down", "Up", "Neutral"]):
+        for cls in labels_order:
+            name = name_map.get(cls, str(cls))
             if np.any(y_test_np == cls):
-                plt.hist(conf_eval_cal[y_test_np == cls], bins=30, alpha=0.5, label=name)
+                plt.hist(
+                    conf_eval_cal[y_test_np == cls],
+                    bins=30,
+                    alpha=0.5,
+                    label=name,
+                )
         plt.legend()
         plt.title(f"Confidence distribution (eval, calibrated) — {symbol}")
         out_hist = OUTPUT_DIR / f"conf_dist_{symbol}_{ts or 'run'}.png"
@@ -555,14 +581,19 @@ def evaluate_model(model, X_test, y_test, symbol="model", ts=None, calib=None):
                 proba=proba_eval_T,           # уже после Temperature
                 target_precision=0.60,
                 calibrator=calibrator,        # чтобы рассчитывался calibrated confidence
-                T=best_T
+                T=best_T,
             )
         except TypeError:
             # старая версия без calibrator/T
-            th_auto, cov_auto = find_threshold_for_precision(y_test_np, proba_eval_T, target_precision=0.60)
+            th_auto, cov_auto = find_threshold_for_precision(
+                y_test_np, proba_eval_T, target_precision=0.60
+            )
 
         if th_auto is not None:
-            logger.info("[Auto-threshold] Precision≥0.6 → th=%.2f | coverage=%.3f", th_auto, cov_auto)
+            logger.info(
+                "[Auto-threshold] Precision≥0.6 → th=%.2f | coverage=%.3f",
+                th_auto, cov_auto,
+            )
         else:
             logger.warning("[Auto-threshold] Не найден порог для precision≥0.6")
     except Exception as e:
